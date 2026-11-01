@@ -1,0 +1,77 @@
+
+# ============================================
+# Python cache
+# ============================================
+__pycache__/
+*.pyc
+*.pyo
+
+# ============================================
+# Conda and virtual environments
+# ============================================
+.venv/
+venv/
+env/
+
+# ============================================
+# Datasets
+# ============================================
+datasets/
+
+# IEMOCAP generated data
+/data/IEMOCAP/Audio_16k/
+/data/IEMOCAP/metalabel.json
+/data/IEMOCAP/labels_sess/
+
+# Generated data in project root
+/Audio_16k/
+/metalabel.json
+/labels_sess/
+
+# ============================================
+# Model checkpoints and weights
+# ============================================
+checkpoints/
+weights/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+
+# ============================================
+# Training logs and outputs
+# ============================================
+logs/
+lightning_logs/
+wandb/
+outputs/
+runs/
+*.log
+
+# ============================================
+# Intermediate features and clustering labels
+# ============================================
+*.npy
+*.npz
+*-clus.json
+all-clus.json
+
+# ============================================
+# Audio files
+# ============================================
+*.wav
+*.flac
+*.mp3
+
+# ============================================
+# Sensitive files
+# ============================================
+.env
+.env.*
+!.env.example
+
+# ============================================
+# VS Code and system files
+# ============================================
+.vscode/
+.DS_Store
