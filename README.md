@@ -48,7 +48,7 @@ The two LRU blocks use a state dimension of **128**. The MLP contains LayerNorm,
 
 ## **Operations Guide**
 
-Run the four scripts **in order for each evaluation fold**. They are not an automated multi-fold pipeline: the dataset files, fold-specific checkpoints, and output paths must be configured before execution. The currently uploaded Stage 2–4 scripts contain **absolute paths for an IEMOCAP Session 1 experiment**; these are examples of the authors' local setup, **not portable default paths**. Update them for your own machine and fold before running.
+Run the four scripts **in order for each evaluation fold**. They are not an automated multi-fold pipeline. The Stage 1–4 scripts use **project-relative paths** for datasets, labels, checkpoints, and output directories. Before running each fold, ensure that the dataset paths and checkpoint filenames are correctly configured. Stage 2 and Stage 3 must use the same selected Stage 1 checkpoint, while Stage 4 must load the corresponding Stage 3 checkpoint. All scripts should be executed from the repository root directory.
 
 ### **1. Prepare the audio and fold labels**
 
