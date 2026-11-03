@@ -1,4 +1,4 @@
-# **Speech Emotion Recognition Using Cluster-Guided Whisper Fine-Tuning and Linear Recurrent Units**
+# Speech Emotion Recognition Using Cluster-Guided Whisper Fine-Tuning and Linear Recurrent Units
 
 This repository contains the implementation of a speech emotion recognition (SER) framework combining **Whisper**, **Cluster-Guided Fine-Tuning (CGFT)**, and **Linear Recurrent Units (LRUs)**. The method first performs supervised fine-tuning of Whisper, then generates clustering-based pseudo-labels for further encoder fine-tuning, and finally jointly trains the adapted Whisper encoder and an LRU-based classifier.
 
@@ -32,7 +32,9 @@ The framework is implemented in four sequential Python scripts:
 | Stage 3 | `whisper_stage3.py` | Cluster-guided Whisper fine-tuning via masked cluster prediction |
 | Stage 4 | `whisper_stage4.py` | Joint Whisper–LRU fine-tuning and emotion classification |
 
-The upstream model is **`openai/whisper-small`**. Encoder **Layer 11** provides the speech representations. In the trainable stages, encoder **Layers 8–11** and the encoder's final LayerNorm are updated; other Whisper parameters remain frozen.
+
+The upstream model is **`openai/whisper-small`**. Speech representations are extracted from **encoder Layer 11**. For the IEMOCAP experiments, **encoder Layers 8–11** are fine-tuned, while the other encoder layers remain frozen. The extracted Layer-11 representations do not pass through the encoder's final LayerNorm.
+
 
 **Stage 1** uses **masked temporal average pooling** and a two-layer **MLP** on top of Whisper Layer 11. It is trained with utterance-level, class-weighted cross-entropy; there is no frame-level auxiliary classification branch.
 
@@ -138,7 +140,8 @@ python whisper_stage4.py
 
 Stage 4 trains Whisper Layers 8–11 jointly with the **two-layer LRU, masked mean pooling, and MLP**. The uploaded configuration uses batch size **16**, LRU state dimension **128**, learning rates **5e-6** (encoder) and **3e-4** (downstream), gradient accumulation of **2**, and up to **10,000 training steps**. It selects the best checkpoint using **`valid_loss`** and then attempts to evaluate that checkpoint on the external `Test` split.
 
-Stage 4 reports **weighted accuracy (`test_WA`)** and **unweighted average recall (`test_UAR`, corresponding to UA)**. It also writes an **`efficiency_metrics.json`** file with training-time and downstream-complexity measurements. `thop` is an **optional** dependency for complexity profiling; its estimates do not fully count custom complex recurrence operations. The scripts do not provide a complete automatic cross-fold aggregation utility.
+Stage 4 reports **weighted accuracy (`test_WA`)** and **unweighted accuracy (`test_UA`)**. The best checkpoint is selected based on the minimum validation loss and evaluated on the held-out test set. The evaluation results are saved in `test_metrics.json`. The scripts do not provide a complete automatic cross-fold aggregation utility.
+
 
 ### **6. Dataset-specific configuration**
 
@@ -168,7 +171,6 @@ The previously recorded experimental environment is summarized below. Exact depe
 | numpy | Required; verify installed version |
 | soundfile | Required; verify installed version |
 | tqdm | Required for Stage 2; verify installed version |
-| thop | Optional, for Stage 4 complexity profiling |
 
 The implementation uses `WhisperModel` and `WhisperFeatureExtractor` from Hugging Face Transformers. Some encoder calls include compatibility handling for different library versions, but equivalent results are not guaranteed across untested environments.
 
