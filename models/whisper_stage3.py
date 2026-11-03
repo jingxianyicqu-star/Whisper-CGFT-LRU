@@ -1,13 +1,7 @@
-
 import os
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-import math
 import json
-import time
+import math
 import inspect
-from collections import Counter
-from contextlib import nullcontext
-from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import soundfile as sf
@@ -15,708 +9,611 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils import data
-from torch.utils.data import random_split
-from torch.utils.data.dataloader import default_collate
+from torch.utils.data import Dataset, DataLoader, random_split
 
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import CSVLogger
-
 from transformers import WhisperModel, WhisperFeatureExtractor
 
 
 # ============================================================
-# Optional THOP profiler
+# Paths: relative to the repository root
 # ============================================================
 
-try:
-    from thop import profile, clever_format
-    THOP_AVAILABLE = True
-    THOP_IMPORT_ERROR = None
-except Exception as exc:
-    profile = None
-    clever_format = None
-    THOP_AVAILABLE = False
-    THOP_IMPORT_ERROR = exc
-
-os.environ.pop("PL_TRAINER_AMP_BACKEND", None)
-
-
-# ============================================================
-# Session paths: relative to the repository root
-# ============================================================
-
+# This script is located in <repository>/models/.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SESSION_ID = 1
 
-# build_saving_path() appends a per-session / per-seed subdirectory.
-BASE_SAVING_DIR = os.path.join(
-    PROJECT_ROOT, "outputs", f"stage4_sess{SESSION_ID}"
-)
 DATADIR = os.path.join(PROJECT_ROOT, "dataset", "Audio_16k")
-LABELPATH = os.path.join(
-    PROJECT_ROOT, "dataset", "labels_sess", f"label_{SESSION_ID}.json"
-)
 
-# Replace this with the Stage3 checkpoint actually used for this fold.
-# Loader supports both:
-#   new Stage3: whisper.encoder....
-#   old Stage3: whisper.model.encoder....
-STAGE3_CKPT_PATH = os.path.join(
+# Stage 2 generated pseudo-labels for Session 1.
+LABELPATH = os.path.join(PROJECT_ROOT, "outputs", "stage2_sess1", "all-clus.json")
+
+# Same Stage 1 checkpoint as Stage 2 INIT_CKPT.
+# Replace the filename with the actual selected Stage 1 checkpoint if different.
+STAGE1_CKPT_PATH = os.path.join(
     PROJECT_ROOT,
     "outputs",
-    f"stage3_sess{SESSION_ID}",
-    "whisper-s3-layer11-epoch=28-val_loss=5.6432-v2.ckpt",
+    "stage1_sess1",
+    "whisper-s1-layer11-out11-epoch=05-valid_loss=1.2547-valid_acc=0.7385.ckpt",
 )
 
-RESUME_CHECKPOINT = None
+# Stage 3 checkpoint output directory.
+SAVING_PATH = os.path.join(PROJECT_ROOT, "outputs", "stage3_sess1")
 
 
 # ============================================================
-# Fixed final configuration
+# 最终固定实验配置
 # ============================================================
 
 WHISPER_MODEL_NAME = "openai/whisper-small"
 
 SAMPLE_RATE = 16000
-HOP_LENGTH = 160
-MAX_MEL_FRAMES = 3000
-TARGET_SEC = 30.0
-TARGET_SAMPLES = int(SAMPLE_RATE * TARGET_SEC)  # 480000
+TARGET_SAMPLES = 480000
 T_ENC = 1500
+IGNORE_INDEX = -100
 
-OUTPUT_LAYER = 11
 TRAIN_LAYER_START = 8
 TRAIN_LAYER_END = 11
+OUTPUT_LAYER = 11
+MASK_INJECT_AFTER_LAYER = 7
 
+KS = [512, 1024, 2048]
+
+BATCH_SIZE = 8
+NUM_WORKERS = 8
+TRAINING_STEP = 20000
+PRECISION = 16
+
+LR_ENC = 1e-5
+LR_HEAD = 7e-5
+WEIGHT_DECAY = 0.02
 VALID_SPLIT = 0.8
 SEED = 42
 
-LRU_LAYERS = 2
-LRU_D_STATE = 128
-LRU_DROPOUT = 0.15
+MASK_PROB = 0.06
+MASK_SPAN_MIN = 5
+MASK_SPAN_MAX = 14  # 每段随机取 5–14 个 token（包含两端）。
 
-# AvePooling+MLP classifier.
-# Kept consistent with the Stage1 mean-pooling + MLP head.
-MLP_HIDDEN_DIM = 128
-MLP_DROPOUT = 0.50
-
+HEAD_DROPOUT = 0.2
 LABEL_SMOOTHING = 0.05
 
-LR_ENC = 5e-6
-LR_HEAD = 3e-4
-WEIGHT_DECAY = 1e-2
-WARMUP_RATIO = 0.10
-FLAT_RATIO = 0.10
-
-BATCH_SIZE = 16
-NUM_WORKERS = 4
-PRECISION = 16
-TRAINING_STEP = 10000
-SAVE_TOP_K = 1
-CHECK_VAL_EVERY_N_EPOCH = 1
-EARLY_STOP_PATIENCE = 12
-ACCUMULATE_GRAD_BATCHES = 2
+EARLY_PATIENCE = 10
+EARLY_MIN_DELTA = 1e-4
 GRAD_CLIP = 1.0
 
-ENABLE_CSV_LOGGER = False
+WARMUP_RATIO = 0.05
+FLAT_RATIO = 0.05
 
 
 # ============================================================
-# Utilities
+# Stage2 pseudo-label loading
 # ============================================================
 
-def multilabel2vec(label_dict: Dict[str, float], label2idx: Dict[str, int]) -> np.ndarray:
-    """Sparse emotion weights -> normalized dense vector."""
-    vec = np.zeros(len(label2idx), dtype=np.float32)
-    for emotion, weight in label_dict.items():
-        if emotion in label2idx:
-            vec[label2idx[emotion]] = float(weight)
+def load_all_clus_json(cluster_json_path: str):
+    """读取最终 Stage2 的 all-clus.json，并固定验证 K=[512,1024,2048]。"""
+    if not os.path.isfile(cluster_json_path):
+        raise FileNotFoundError(
+            f"[Stage3] 找不到 Stage2 pseudo-label 文件：{cluster_json_path}"
+        )
 
-    total = float(vec.sum())
-    if total > 0:
-        vec /= total
-    else:
-        vec[:] = 1.0 / max(1, len(label2idx))
-    return vec
+    with open(cluster_json_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "[Stage3] all-clus.json 应为 dict[name] -> List[List[int]]。"
+        )
+
+    cluster_label_dict = {}
+
+    for name, seq_lists in raw.items():
+        if str(name).startswith("__"):
+            continue
+
+        if not isinstance(seq_lists, list) or len(seq_lists) != len(KS):
+            raise ValueError(
+                f"[Stage3] {name} 的 head 数不正确："
+                f"got={len(seq_lists) if isinstance(seq_lists, list) else type(seq_lists)}, "
+                f"expected={len(KS)}"
+            )
+
+        tensors = []
+        reference_length = None
+
+        for head_idx, (seq, k) in enumerate(zip(seq_lists, KS)):
+            if not isinstance(seq, list):
+                raise ValueError(
+                    f"[Stage3] {name}, head={head_idx} 的标签序列不是 list。"
+                )
+
+            if reference_length is None:
+                reference_length = len(seq)
+            elif len(seq) != reference_length:
+                raise ValueError(
+                    f"[Stage3] {name} 的不同 cluster heads 标签长度不一致。"
+                )
+
+            arr = torch.tensor(seq, dtype=torch.long)
+            valid = arr[arr != IGNORE_INDEX]
+
+            if valid.numel() > 0:
+                min_id = int(valid.min().item())
+                max_id = int(valid.max().item())
+                if min_id < 0:
+                    raise ValueError(
+                        f"[Stage3] {name}, head={head_idx} 存在非法负标签 {min_id}。"
+                    )
+                if max_id >= k:
+                    raise ValueError(
+                        f"[Stage3] {name}, head={head_idx}: label max={max_id} >= K={k}"
+                    )
+
+            tensors.append(arr)
+
+        cluster_label_dict[name] = torch.stack(tensors, dim=0)
+
+    if not cluster_label_dict:
+        raise ValueError("[Stage3] all-clus.json 中没有有效样本。")
+
+    first_name = next(iter(cluster_label_dict))
+    print(f"[Stage3] Loaded pseudo labels: {len(cluster_label_dict)} utterances")
+    print(f"[Stage3] K = {KS}")
+    print(
+        f"[Stage3] Example label shape: "
+        f"{tuple(cluster_label_dict[first_name].shape)}"
+    )
+
+    return cluster_label_dict
 
 
-def compute_valid_token_length(wav_len_samples: int) -> int:
-    """Valid waveform samples -> valid Whisper encoder-token length."""
-    if wav_len_samples <= 0:
-        return 1
+# ============================================================
+# Audio preprocessing
+# ============================================================
 
-    n_mel = int(math.ceil(wav_len_samples / float(HOP_LENGTH)))
-    n_mel = min(MAX_MEL_FRAMES, max(1, n_mel))
-    return max(1, (n_mel + 1) // 2)
-
-
-def build_valid_token_mask(
-    valid_wav_lens: torch.Tensor,
-    token_length: int,
-    device,
-) -> torch.Tensor:
-    """Return [B,T] bool mask. True=real speech, False=zero padding."""
-    if not torch.is_tensor(valid_wav_lens):
-        valid_wav_lens = torch.tensor(valid_wav_lens)
-
-    valid_wav_lens = valid_wav_lens.detach().cpu().long().view(-1)
-    valid_Ts = [
-        min(compute_valid_token_length(int(x.item())), token_length)
-        for x in valid_wav_lens
-    ]
-    valid_Ts = torch.tensor(valid_Ts, device=device, dtype=torch.long)
-    t = torch.arange(token_length, device=device).view(1, token_length)
-    return t < valid_Ts.view(-1, 1)
-
-
-@torch.no_grad()
-def wa_ua_from_preds(
-    preds: torch.Tensor,
-    targets: torch.Tensor,
-    num_classes: int,
-    eps: float = 1e-12,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def zero_pad_or_center_crop_to_30s(wav: np.ndarray, valid_len: int):
     """
-    Calculate WA (overall accuracy) and UA (macro class recall).
-    UA is the same metric often called UAR in SER papers.
-    Only classes present in the evaluated split contribute to UA,
-    preserving the metric convention of the original experiment.
-    Confusion-matrix bincount is intentionally done on CPU.
+    与最终 Stage1 / Stage2 保持一致：
+        <30s  -> 末尾 zero-padding
+        =30s  -> 不变
+        >30s  -> center crop
     """
-    device = preds.device
-    K = int(num_classes)
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    valid_len = int(max(0, min(valid_len, wav.shape[0])))
+    base = wav[:valid_len] if valid_len > 0 else wav
+    length = int(base.shape[0])
 
-    preds_cpu = preds.detach().long().cpu()
-    targets_cpu = targets.detach().long().cpu()
+    if length <= 0:
+        return np.zeros((TARGET_SAMPLES,), dtype=np.float32), 0
 
-    indices = targets_cpu * K + preds_cpu
-    confusion = torch.bincount(indices, minlength=K * K).reshape(K, K)
+    if length >= TARGET_SAMPLES:
+        start = (length - TARGET_SAMPLES) // 2
+        segment = base[start:start + TARGET_SAMPLES]
+        return segment.astype(np.float32, copy=False), TARGET_SAMPLES
 
-    wa = torch.diag(confusion).sum().float() / confusion.sum().float().clamp_min(1.0)
-
-    class_count = confusion.sum(dim=1).float()
-    recall = torch.diag(confusion).float() / class_count.clamp_min(eps)
-    present = class_count > 0
-    ua = recall[present].mean() if present.any() else torch.tensor(0.0)
-
-    return wa.to(device), ua.to(device), confusion.to(device)
+    output = np.zeros((TARGET_SAMPLES,), dtype=np.float32)
+    output[:length] = base
+    return output, length
 
 
-def get_gpu_memory_usage_mb() -> float:
-    """Same efficiency definition as the original code."""
-    if not torch.cuda.is_available():
-        return 0.0
-    try:
-        return float(torch.cuda.memory_allocated() / (1024 * 1024))
-    except Exception:
-        return 0.0
+# ============================================================
+# Mask generation
+# ============================================================
+
+def make_time_mask_tok_valid(valid_mask_tok: torch.Tensor) -> torch.Tensor:
+    """
+    在有效 token 区域生成 span masking。
+
+    最终配置：MASK_PROB=0.06，每段随机取 5–14 个 token。
+    不同 span 不重叠。
+    """
+    if valid_mask_tok.dim() != 2:
+        raise ValueError("[Stage3] valid_mask_tok 必须是 [B,T]。")
+
+    batch_size, token_length = valid_mask_tok.shape
+    device = valid_mask_tok.device
+    mask = torch.zeros(
+        batch_size, token_length, dtype=torch.bool, device=device
+    )
+
+    for b in range(batch_size):
+        valid_len = int(valid_mask_tok[b].long().sum().item())
+        valid_len = max(1, min(valid_len, token_length))
+
+        if valid_len <= 1:
+            continue
+
+        num_mask = int(valid_len * MASK_PROB)
+        if num_mask <= 0:
+            continue
+
+        masked = 0
+        tries = 0
+
+        while masked < num_mask and tries < 10 * num_mask:
+            span = int(
+                torch.randint(
+                    MASK_SPAN_MIN, MASK_SPAN_MAX + 1,
+                    (1,), device=device
+                ).item()
+            )
+            span = min(span, valid_len)
+
+            start_max = max(1, valid_len - span + 1)
+            start = int(
+                torch.randint(
+                    0, start_max, (1,), device=device
+                ).item()
+            )
+            end = min(valid_len, start + span)
+
+            if mask[b, start:end].any():
+                tries += 1
+                continue
+
+            mask[b, start:end] = True
+            masked += end - start
+
+    return mask & valid_mask_tok
 
 
 # ============================================================
 # Dataset
 # ============================================================
 
-class PretrainEmoDataset(data.Dataset):
-    """
-    Final Stage4 dataset.
+class Stage3Dataset(Dataset):
+    """Stage3 样本由 Stage2 all-clus.json 中的文件名决定。"""
 
-    Audio:
-        <30 s -> zero-pad at the end
-        =30 s -> unchanged
-        >30 s -> center-crop
-
-    Output:
-        waveform, hard emotion label, original waveform length
-    """
-
-    def __init__(
-        self,
-        datadir: str,
-        labeldir: str,
-        split: str,
-        labeldict: Optional[Dict[str, int]] = None,
-        emoset=None,
-    ):
-        with open(labeldir, "r", encoding="utf-8") as f:
-            raw_label = json.load(f)
-
-        if isinstance(raw_label, dict) and any(
-            key in raw_label for key in ["Train", "Val", "Test"]
-        ):
-            if split not in raw_label:
-                raise ValueError(
-                    f"label json missing split='{split}', keys={list(raw_label.keys())}"
-                )
-            self.label = raw_label[split]
-        else:
-            self.label = raw_label
-
-        self.split = split
-        datadir = datadir.rstrip("/")
-
-        self.datasetbase = [
-            name for name in os.listdir(datadir) if name in self.label
-        ]
-        self.dataset = [
-            os.path.join(datadir, name) for name in self.datasetbase
-        ]
-
-        if len(self.dataset) == 0:
-            raise ValueError(
-                f"[Dataset] 0 matching wav files: datadir={datadir}, split={split}"
-            )
-
-        raw_emotions = []
-        for value in self.label.values():
-            if isinstance(value, str):
-                raw_emotions.append(value)
-            else:
-                raw_emotions.extend(value.keys())
-
-        self.emos = Counter(raw_emotions)
-
-        if labeldict is None or emoset is None:
-            self.emoset = list(self.emos.keys())
-            self.labeldict = {
-                emotion: idx for idx, emotion in enumerate(self.emoset)
-            }
-        else:
-            self.emoset = list(emoset)
-            self.labeldict = dict(labeldict)
-
-            unknown = sorted(set(raw_emotions) - set(self.labeldict.keys()))
-            if unknown:
-                raise ValueError(
-                    f"[Dataset] split={split} contains unknown emotions {unknown}; "
-                    f"train mapping={self.emoset}"
-                )
-
-        self.nemos = len(self.emoset)
-
-        print(f"[PretrainEmoDataset] split='{split}', n={len(self.dataset)}")
-        print("----Involved Emotions----")
-        for emotion, count in self.emos.items():
-            print(f"{emotion}: {count} examples")
+    def __init__(self, datadir: str, cluster_label_dict):
+        super().__init__()
+        self.datadir = datadir.rstrip("/")
+        self.cluster_label_dict = cluster_label_dict
+        self.names = sorted(cluster_label_dict.keys())
+        print(f"[Stage3] Total {len(self.names)} examples.")
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.names)
 
-    def _hard_label_from_raw(self, value) -> int:
-        if isinstance(value, str):
-            if value not in self.labeldict:
-                raise ValueError(f"Unknown emotion label: {value}")
-            return int(self.labeldict[value])
+    def __getitem__(self, idx):
+        name = self.names[idx]
+        wav_path = os.path.join(self.datadir, name)
 
-        probability = multilabel2vec(value, self.labeldict)
-        return int(np.argmax(probability))
+        if not os.path.isfile(wav_path):
+            raise FileNotFoundError(
+                f"[Stage3] 找不到音频文件：{wav_path} (name={name})"
+            )
 
-    def hard_label_at_index(self, index: int) -> int:
-        """Get a label without reading the waveform."""
-        name = self.datasetbase[int(index)]
-        return self._hard_label_from_raw(self.label[name])
+        wav, sr = sf.read(wav_path)
 
-    def __getitem__(self, index):
-        wav, sr = sf.read(self.dataset[index])
+        if sr != SAMPLE_RATE:
+            raise ValueError(
+                f"[Stage3] {wav_path} 采样率={sr}，预期={SAMPLE_RATE}"
+            )
 
         if wav.ndim == 2:
             wav = wav.mean(axis=1)
 
-        if sr != SAMPLE_RATE:
-            raise ValueError(
-                f"[Dataset] sample rate={sr}, expected={SAMPLE_RATE} "
-                f"@ {self.datasetbase[index]}"
-            )
-
-        label = self._hard_label_from_raw(
-            self.label[self.datasetbase[index]]
-        )
-
         wav = wav.astype(np.float32)
-        return wav, label, int(wav.shape[0])
+        wav_tensor = torch.from_numpy(wav)
+        wav_len = int(wav_tensor.numel())
+        cluster_labels = self.cluster_label_dict[name]
 
-    @staticmethod
-    def _zero_pad_or_center_crop(wav: np.ndarray) -> Tuple[np.ndarray, int]:
-        wav = np.asarray(wav, dtype=np.float32).reshape(-1)
-        length = int(wav.shape[0])
-
-        if length <= 0:
-            return np.zeros(TARGET_SAMPLES, dtype=np.float32), 0
-
-        if length >= TARGET_SAMPLES:
-            start = (length - TARGET_SAMPLES) // 2
-            segment = wav[start:start + TARGET_SAMPLES]
-            return segment.astype(np.float32, copy=False), TARGET_SAMPLES
-
-        output = np.zeros(TARGET_SAMPLES, dtype=np.float32)
-        output[:length] = wav
-        return output, length
-
-    def pad30s_collate(self, batch):
-        processed = []
-
-        for wav, label, wav_len in batch:
-            wav = np.asarray(wav, dtype=np.float32).reshape(-1)
-            wav_len = max(0, min(int(wav_len), wav.shape[0]))
-            base = wav[:wav_len] if wav_len > 0 else wav
-
-            wav_30s, valid_len = self._zero_pad_or_center_crop(base)
-            processed.append((wav_30s, int(label), int(valid_len)))
-
-        return default_collate(processed)
+        return wav_tensor, wav_len, cluster_labels, name
 
 
 # ============================================================
-# Masked temporal mean pooling (no trainable parameters)
+# Stage3 PTAPT model
 # ============================================================
 
-class MaskedMeanPool(nn.Module):
-    """Average valid time steps only: [B, T, D] -> [B, D]."""
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected [B, T, D], got {tuple(x.shape)}")
-        if tuple(valid_mask.shape) != tuple(x.shape[:2]):
-            raise ValueError(
-                f"Mask shape {tuple(valid_mask.shape)} does not match "
-                f"input shape {tuple(x.shape[:2])}"
-            )
-        valid_mask = valid_mask.to(device=x.device, dtype=torch.bool)
-        # Float32 accumulation avoids overflow during mixed-precision training.
-        x_float = x.float().masked_fill(~valid_mask.unsqueeze(-1), 0.0)
-        count = valid_mask.sum(dim=1, keepdim=True).clamp_min(1).float()
-        return (x_float.sum(dim=1) / count).to(dtype=x.dtype)
-
-
-class MLPHead(nn.Module):
-    """Utterance-level MLP used after temporal average pooling."""
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        num_classes: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self.layer_norm = nn.LayerNorm(in_dim)
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(hidden_dim, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.layer_norm(x)
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.dropout(x)
-        return self.fc2(x)
-
-
-# ============================================================
-# LRU
-# ============================================================
-
-class LRULayer(nn.Module):
+class WhisperPTAPTModule(pl.LightningModule):
     """
-    Preserve the original LRU recurrence:
-        s_t = lambda * s_(t-1) + u_t
+    最终 Stage3：
+      1. Whisper-small
+      2. 加载 Stage1 Whisper 权重
+      3. 冻结全部 Whisper
+      4. 解冻 encoder Layers 8-11 + encoder final LayerNorm
+      5. Layer 7 后注入 learnable mask token
+      6. 输出 Layer 11 representation
+      7. 三个 heads 预测 K=512/1024/2048 pseudo-labels
+      8. 仅在 masked & valid tokens 上计算 weighted CE
     """
 
-    def __init__(self, d_model: int, d_state: int, dropout: float):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-
-        self.in_proj = nn.Linear(d_model, d_state)
-        self.out_proj = nn.Linear(d_state, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-        self.D = nn.Parameter(torch.ones(d_model))
-        self.nu = nn.Parameter(torch.randn(d_state) * 0.1)
-        self.theta = nn.Parameter(torch.rand(d_state) * (2.0 * math.pi))
-
-    def _lambda(self, device):
-        magnitude = torch.exp(-torch.exp(self.nu)).to(device)
-        theta = self.theta.to(device)
-        lam = magnitude * (torch.cos(theta) + 1j * torch.sin(theta))
-        return lam.to(torch.complex64)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Complex recurrence is intentionally outside fp16 autocast.
-        ctx = torch.cuda.amp.autocast(enabled=False) if x.is_cuda else nullcontext()
-
-        with ctx:
-            x_f = x.float()
-            B, T, _ = x_f.shape
-
-            u = self.in_proj(x_f).to(torch.complex64)
-            lam = self._lambda(x_f.device)
-
-            state = torch.zeros(
-                B, self.d_state,
-                device=x_f.device,
-                dtype=torch.complex64,
-            )
-            states = torch.empty(
-                B, T, self.d_state,
-                device=x_f.device,
-                dtype=torch.complex64,
-            )
-
-            for t in range(T):
-                state = lam * state + u[:, t, :]
-                states[:, t, :] = state
-
-            y = self.out_proj(states.real)
-            y = y + x_f * self.D
-            y = F.gelu(y)
-            return self.dropout(y)
-
-
-class LRUBlock(nn.Module):
-    def __init__(self, d_model: int, d_state: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.lru = LRULayer(d_model, d_state, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.lru(self.norm(x))
-
-
-class LRUStack(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_layers: int,
-        d_state: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            LRUBlock(d_model, d_state, dropout)
-            for _ in range(n_layers)
-        ])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-
-# ============================================================
-# Whisper Layer-11 wrapper
-# ============================================================
-
-class WhisperLayer11Wrapper(nn.Module):
-    """
-    Final Stage4 Whisper behavior:
-        - create Whisper-small
-        - load Whisper weights from Stage3 checkpoint
-        - freeze all Whisper parameters
-        - unfreeze encoder Layers 8-11
-        - execute encoder only through Layer 11
-        - return Layer-11 representations
-
-    The encoder's final LayerNorm remains frozen, matching the uploaded
-    Stage4 code's trainability behavior.
-    """
-
-    def __init__(self, stage3_ckpt_path: str):
+    def __init__(self):
         super().__init__()
 
-        self.model = WhisperModel.from_pretrained(WHISPER_MODEL_NAME)
+        self.batch_size = BATCH_SIZE
+        self.num_workers = NUM_WORKERS
+        self.maxstep = TRAINING_STEP
+
+        # Stage2 pseudo-labels
+        cluster_label_dict = load_all_clus_json(LABELPATH)
+
+        # Whisper-small
+        self.whisper = WhisperModel.from_pretrained(WHISPER_MODEL_NAME)
         self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
             WHISPER_MODEL_NAME
         )
-        self.hidden_size = int(self.model.config.d_model)
-        self._fallback_warned = False
+        d_model = int(self.whisper.config.d_model)
 
-        self._load_stage3_whisper(stage3_ckpt_path)
+        # Load Stage1 adapted Whisper weights
+        self._load_stage1_checkpoint(STAGE1_CKPT_PATH)
 
-        for parameter in self.model.parameters():
-            parameter.requires_grad = False
+        # Freeze all, then unfreeze encoder Layers 8-11.
+        for p in self.whisper.parameters():
+            p.requires_grad = False
 
-        for layer in self.model.encoder.layers[
+        for layer in self.whisper.encoder.layers[
             TRAIN_LAYER_START - 1:TRAIN_LAYER_END
         ]:
-            for parameter in layer.parameters():
-                parameter.requires_grad = True
+            for p in layer.parameters():
+                p.requires_grad = True
 
-        print(
-            f"[Stage4] Whisper train layers = "
-            f"{TRAIN_LAYER_START}-{TRAIN_LAYER_END}"
+        # 保留原 Stage1 wrapper 的行为。
+        for p in self.whisper.encoder.layer_norm.parameters():
+            p.requires_grad = True
+
+        # Learnable mask embedding
+        self.mask_token = nn.Parameter(torch.zeros(d_model))
+        nn.init.normal_(self.mask_token, mean=0.0, std=0.02)
+
+        # 80/20 train-validation split
+        full_data = Stage3Dataset(DATADIR, cluster_label_dict)
+        n_total = len(full_data)
+        n_train = int(n_total * VALID_SPLIT)
+        n_val = n_total - n_train
+
+        self.train_data, self.val_data = random_split(
+            full_data,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(SEED),
         )
-        print(f"[Stage4] Whisper output layer = {OUTPUT_LAYER}")
+        print(f"[Stage3] 数据划分：train={n_train}, val={n_val}")
 
-    def _load_stage3_whisper(self, ckpt_path: str):
+        # Three cluster-prediction heads
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(p=HEAD_DROPOUT),
+                nn.Linear(d_model, k),
+            )
+            for k in KS
+        ])
+
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=LABEL_SMOOTHING,
+            ignore_index=IGNORE_INDEX,
+        )
+
+        # 保留原代码：w_k ∝ 1/log(K)
+        raw_weights = [1.0 / np.log(k + 1e-8) for k in KS]
+        total_weight = sum(raw_weights)
+        normalized_weights = [w / total_weight for w in raw_weights]
+        self.register_buffer(
+            "head_weights",
+            torch.tensor(normalized_weights, dtype=torch.float32),
+        )
+
+        print(f"[Stage3] head Ks={KS}")
+        print(f"[Stage3] head weights={normalized_weights}")
+
+        trainable_names = [
+            name for name, p in self.whisper.named_parameters()
+            if p.requires_grad
+        ]
+        print(
+            f"[Stage3] Trainable Whisper parameter tensors="
+            f"{len(trainable_names)}"
+        )
+
+    # --------------------------------------------------------
+    # Stage1 checkpoint
+    # --------------------------------------------------------
+
+    def _load_stage1_checkpoint(self, ckpt_path: str):
         """
-        Load Whisper parameters only.
-
-        Supported checkpoint formats:
-          new Stage3 : whisper.encoder....
-          old Stage3 : whisper.model.encoder....
+        最终 Stage1 Lightning checkpoint 中 WhisperModel 参数前缀为：
+            whisper.model.*
+        去掉该前缀后加载到 Stage3 的 WhisperModel。
         """
-        if ckpt_path in [None, "", "None", "none"]:
-            raise ValueError("[Stage4] STAGE3_CKPT_PATH is empty.")
+        ckpt_path = os.path.expanduser(ckpt_path)
 
-        ckpt_path = os.path.expanduser(str(ckpt_path))
         if not os.path.isfile(ckpt_path):
             raise FileNotFoundError(
-                f"[Stage4] Stage3 checkpoint not found: {ckpt_path}"
+                f"[Stage3] 找不到 Stage1 ckpt：{ckpt_path}"
+            )
+        if not ckpt_path.endswith(".ckpt"):
+            raise ValueError(
+                f"[Stage3] Stage1 checkpoint 必须是 .ckpt：{ckpt_path}"
             )
 
-        print(f"[Stage4] Loading Whisper from Stage3:\n{ckpt_path}")
-
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
-        state_dict = checkpoint.get("state_dict", checkpoint)
+        print(f"[Stage3] Loading Stage1 checkpoint:\n{ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        state_dict = ckpt.get("state_dict", ckpt)
 
         if not isinstance(state_dict, dict):
-            raise RuntimeError("[Stage4] Invalid Stage3 state_dict.")
+            raise RuntimeError("[Stage3] Invalid Stage1 checkpoint state_dict.")
 
-        target_state = self.model.state_dict()
+        prefix = "whisper.model."
+        whisper_state = {
+            key[len(prefix):]: value
+            for key, value in state_dict.items()
+            if key.startswith(prefix)
+        }
 
-        prefixes = [
-            "whisper.",
-            "whisper.model.",
-            "module.whisper.",
-            "module.whisper.model.",
-        ]
-
-        best_state = {}
-        best_prefix = None
-
-        for prefix in prefixes:
-            candidate = {}
-            for key, value in state_dict.items():
-                if not key.startswith(prefix):
-                    continue
-
-                stripped = key[len(prefix):]
-                if (
-                    stripped in target_state
-                    and hasattr(value, "shape")
-                    and value.shape == target_state[stripped].shape
-                ):
-                    candidate[stripped] = value
-
-            if len(candidate) > len(best_state):
-                best_state = candidate
-                best_prefix = prefix
-
-        if len(best_state) == 0:
-            sample_keys = list(state_dict.keys())[:20]
+        if not whisper_state:
+            sample_keys = list(state_dict.keys())[:10]
             raise RuntimeError(
-                "[Stage4] No compatible Whisper tensors found in Stage3 ckpt.\n"
-                f"Sample keys: {sample_keys}"
+                "[Stage3] checkpoint 中没有找到 'whisper.model.*' 参数。\n"
+                f"sample keys={sample_keys}"
             )
 
-        missing, unexpected = self.model.load_state_dict(
-            best_state,
+        missing, unexpected = self.whisper.load_state_dict(
+            whisper_state,
             strict=False,
         )
 
         print(
-            f"[Stage4] Stage3 Whisper load: prefix='{best_prefix}', "
-            f"matched={len(best_state)}, missing={len(missing)}, "
-            f"unexpected={len(unexpected)}"
+            "[Stage3] Stage1 Whisper weights loaded: "
+            f"source_keys={len(whisper_state)}, "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
         )
+        if missing:
+            print(f"[Stage3] missing keys sample: {missing[:10]}")
+        if unexpected:
+            print(f"[Stage3] unexpected keys sample: {unexpected[:10]}")
 
-    def trainable_params(self):
-        return [
-            p for p in self.parameters()
-            if p.requires_grad
-        ]
-
-    @staticmethod
-    def _encoder_embed(
-        encoder,
-        input_features: torch.Tensor,
-    ) -> torch.Tensor:
-        x = F.gelu(encoder.conv1(input_features))
-        x = F.gelu(encoder.conv2(x))
-        x = x.permute(0, 2, 1)
-
-        positional = None
-        if hasattr(encoder, "embed_positions") and encoder.embed_positions is not None:
-            try:
-                positional = encoder.embed_positions(x.shape)
-            except Exception:
-                try:
-                    positional = encoder.embed_positions.weight[:x.size(1)]
-                except Exception:
-                    positional = None
-
-        if positional is not None:
-            if positional.dim() == 2:
-                positional = positional.unsqueeze(0)
-            x = x + positional.to(device=x.device, dtype=x.dtype)
-
-        dropout = getattr(encoder, "dropout", 0.0)
-        if isinstance(dropout, nn.Dropout):
-            x = dropout(x)
-        else:
-            try:
-                p = float(dropout)
-                if p > 0:
-                    x = F.dropout(x, p=p, training=encoder.training)
-            except Exception:
-                pass
-
-        return x
+    # --------------------------------------------------------
+    # Whisper manual encoder forward
+    # --------------------------------------------------------
 
     @staticmethod
-    def _expand_attention_mask(
-        valid_mask: torch.Tensor,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """[B,T] valid mask -> [B,1,T,T] additive mask."""
-        valid_mask = valid_mask.bool()
-        B, T = valid_mask.shape
+    def _get_positional_embedding(encoder, input_shape, device, dtype):
+        """保留轻量兼容逻辑，适配不同 transformers 版本。"""
+        if not hasattr(encoder, "embed_positions"):
+            return None
 
-        additive = (~valid_mask).to(dtype=dtype) * torch.finfo(dtype).min
-        return additive[:, None, None, :].expand(B, 1, T, T)
+        try:
+            pos = encoder.embed_positions(input_shape)
+        except TypeError:
+            dummy = torch.zeros(
+                input_shape,
+                dtype=torch.long,
+                device=device,
+            )
+            pos = encoder.embed_positions(dummy)
+
+        return pos.to(device=device, dtype=dtype)
 
     @staticmethod
-    def _call_encoder_layer(
-        layer,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Small compatibility layer for nearby transformers versions."""
+    def _build_additive_attention_mask(valid_mask_tok, dtype, device):
+        """[B,T] valid mask -> [B,1,1,T] additive attention mask。"""
+        if valid_mask_tok is None:
+            return None
+
+        if valid_mask_tok.dtype != torch.bool:
+            valid_mask_tok = valid_mask_tok.bool()
+
+        valid_mask_tok = valid_mask_tok.to(device=device)
+        invalid = ~valid_mask_tok
+        attention_mask = invalid.to(dtype=dtype) * (-1e4)
+        return attention_mask[:, None, None, :]
+
+    @staticmethod
+    def _call_encoder_layer(layer, hidden_states, attention_mask_4d=None):
+        """兼容不同 transformers 版本中的 WhisperEncoderLayer 参数。"""
         signature = inspect.signature(layer.forward)
         kwargs = {}
 
         if "attention_mask" in signature.parameters:
-            kwargs["attention_mask"] = attention_mask
+            kwargs["attention_mask"] = attention_mask_4d
         if "layer_head_mask" in signature.parameters:
             kwargs["layer_head_mask"] = None
         if "output_attentions" in signature.parameters:
             kwargs["output_attentions"] = False
 
         output = layer(hidden_states, **kwargs)
-        return output[0] if isinstance(output, (tuple, list)) else output
+        if isinstance(output, (tuple, list)):
+            return output[0]
+        return output
 
-    def encode_layer11(
+    def _encode_features_with_mask(
         self,
-        wav_30s: torch.Tensor,
-        valid_wav_lens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_features: torch.Tensor,
+        mask_tok: torch.Tensor,
+        valid_mask_tok: torch.Tensor,
+    ):
         """
-        Returns:
-          reps       [B,T,C], Whisper encoder Layer 11
-          valid_mask [B,T], True for real speech tokens
-        """
-        if wav_30s.dim() == 1:
-            wav_30s = wav_30s.unsqueeze(0)
+        手动执行 Whisper encoder 到 Layer 11：
 
-        wav_cpu = wav_30s.detach().cpu().numpy()
+        conv frontend
+          -> Layers 1-7
+          -> mask-token injection
+          -> Layers 8-11
+          -> Layer 11 representation
+        """
+        encoder = self.whisper.encoder
+
+        hidden_states = F.gelu(encoder.conv1(input_features))
+        hidden_states = F.gelu(encoder.conv2(hidden_states))
+        hidden_states = hidden_states.permute(0, 2, 1)  # [B,T,C]
+
+        pos = self._get_positional_embedding(
+            encoder,
+            hidden_states.size()[:-1],
+            hidden_states.device,
+            hidden_states.dtype,
+        )
+        if pos is not None:
+            hidden_states = hidden_states + pos
+
+        dropout_p = float(getattr(encoder, "dropout", 0.0))
+        if dropout_p > 0:
+            hidden_states = F.dropout(
+                hidden_states,
+                p=dropout_p,
+                training=self.training,
+            )
+
+        batch_size, token_length, _ = hidden_states.shape
+
+        if token_length != T_ENC:
+            raise RuntimeError(
+                f"[Stage3] Whisper token length={token_length}, expected={T_ENC}"
+            )
+        if valid_mask_tok.shape != (batch_size, token_length):
+            raise RuntimeError(
+                f"[Stage3] valid_mask shape={tuple(valid_mask_tok.shape)}, "
+                f"expected=({batch_size},{token_length})"
+            )
+        if mask_tok.shape != (batch_size, token_length):
+            raise RuntimeError(
+                f"[Stage3] mask_tok shape={tuple(mask_tok.shape)}, "
+                f"expected=({batch_size},{token_length})"
+            )
+
+        attention_mask_4d = self._build_additive_attention_mask(
+            valid_mask_tok,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        # 只执行到 Layer 11。
+        for layer_idx in range(OUTPUT_LAYER):
+            layer = encoder.layers[layer_idx]
+            hidden_states = self._call_encoder_layer(
+                layer,
+                hidden_states,
+                attention_mask_4d,
+            )
+
+            # 完成 Layer 7 后，注入 learnable mask embedding。
+            # 使用 torch.where 避免 PyTorch 2.0.1 + CUDA 下
+            # Boolean advanced-indexing assignment 的广播问题。
+            if layer_idx + 1 == MASK_INJECT_AFTER_LAYER:
+                mask_tok = mask_tok.bool()
+
+                mask_value = self.mask_token.to(
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                ).view(1, 1, -1)
+
+                hidden_states = torch.where(
+                    mask_tok.unsqueeze(-1),
+                    mask_value,
+                    hidden_states,
+                )
+
+        return hidden_states
+
+    def encode_with_hidden_mask(
+        self,
+        wav_batch: torch.Tensor,
+        mask_tok: torch.Tensor,
+        valid_mask_tok: torch.Tensor,
+    ):
+        """waveform -> Whisper log-Mel -> masked Layer-11 representation。"""
+        wav_cpu = wav_batch.detach().cpu().numpy()
 
         input_features = self.feature_extractor(
             wav_cpu,
@@ -725,402 +622,134 @@ class WhisperLayer11Wrapper(nn.Module):
             padding="max_length",
             truncation=True,
             max_length=TARGET_SAMPLES,
-        ).input_features
+        ).input_features.to(self.device)
 
-        device = next(self.model.parameters()).device
-        input_features = input_features.to(device)
-
-        try:
-            encoder = self.model.encoder
-            hidden_states = self._encoder_embed(encoder, input_features)
-            T = int(hidden_states.size(1))
-
-            valid_mask = build_valid_token_mask(
-                valid_wav_lens,
-                token_length=T,
-                device=hidden_states.device,
-            )
-            attention_mask = self._expand_attention_mask(
-                valid_mask,
-                hidden_states.dtype,
-            )
-
-            # Layer index 0..10 => human-readable Layers 1..11.
-            for layer_index in range(OUTPUT_LAYER):
-                hidden_states = self._call_encoder_layer(
-                    encoder.layers[layer_index],
-                    hidden_states,
-                    attention_mask,
-                )
-
-            return hidden_states, valid_mask
-
-        except Exception as exc:
-            if not self._fallback_warned:
-                print(
-                    "[WhisperLayer11Wrapper][WARN] manual Layer-11 path "
-                    "failed; fallback to output_hidden_states=True."
-                )
-                print(f"[WhisperLayer11Wrapper][WARN] reason: {repr(exc)}")
-                self._fallback_warned = True
-
-            valid_mask = build_valid_token_mask(
-                valid_wav_lens,
-                token_length=T_ENC,
-                device=input_features.device,
-            )
-
-            output = self.model.encoder(
-                input_features=input_features,
-                attention_mask=valid_mask,
-                return_dict=True,
-                output_hidden_states=True,
-            )
-            reps = output.hidden_states[OUTPUT_LAYER]
-
-            if valid_mask.size(1) != reps.size(1):
-                valid_mask = build_valid_token_mask(
-                    valid_wav_lens,
-                    token_length=int(reps.size(1)),
-                    device=reps.device,
-                )
-
-            return reps, valid_mask
-
-
-# ============================================================
-# Downstream complexity profiling
-# ============================================================
-
-class DownstreamProfileWrapper(nn.Module):
-    """
-    Profile the simplified downstream only:
-      LRU + masked temporal average pooling + MLP classifier.
-    """
-
-    def __init__(self, stage4_model):
-        super().__init__()
-        self.lru = stage4_model.lru
-        self.utt_pool = stage4_model.utt_pool
-        self.utt_head = stage4_model.utt_head
-
-    def forward(
-        self,
-        reps: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ):
-        valid_mask = valid_mask.bool()
-        reps = reps.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
-
-        seq = self.lru(reps)
-        utt_repr = self.utt_pool(seq, valid_mask)
-        utt_logits = self.utt_head(utt_repr)
-
-        return utt_logits
-
-
-@torch.no_grad()
-def get_model_metrics(
-    stage4_model,
-    seq_len: int,
-    input_dim: int,
-) -> Dict[str, Any]:
-    """
-    THOP convention:
-        macs, params = profile(...)
-        FLOPs = 2 * MACs
-    """
-    result = {
-        "available": False,
-        "params": None,
-        "params_m": None,
-        "params_str": None,
-        "macs": None,
-        "flops": None,
-        "flops_m": None,
-        "flops_str": None,
-        "seq_len": int(seq_len),
-        "input_dim": int(input_dim),
-        "batch_size": 1,
-        "scope": "downstream_lru_avepool_mlp",
-        "method": "THOP profile; FLOPs = MACs * 2.0",
-    }
-
-    if not THOP_AVAILABLE:
-        print("[Efficiency][WARN] THOP unavailable; skip Parameters/FLOPs.")
-        print(f"[Efficiency][WARN] {repr(THOP_IMPORT_ERROR)}")
-        return result
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prof_model = DownstreamProfileWrapper(stage4_model).to(device).eval()
-
-    dummy_input = torch.randn(
-        1, int(seq_len), int(input_dim),
-        dtype=torch.float32,
-        device=device,
-    )
-    dummy_mask = torch.ones(
-        1, int(seq_len),
-        dtype=torch.bool,
-        device=device,
-    )
-
-    try:
-        macs, params = profile(
-            prof_model,
-            inputs=(dummy_input, dummy_mask),
-            verbose=False,
+        return self._encode_features_with_mask(
+            input_features,
+            mask_tok,
+            valid_mask_tok,
         )
-        flops = macs * 2.0
-        flops_str, params_str = clever_format([flops, params], "%.3f")
-
-        result.update({
-            "available": True,
-            "params": float(params),
-            "params_m": float(params) / 1e6,
-            "params_str": str(params_str),
-            "macs": float(macs),
-            "flops": float(flops),
-            "flops_m": float(flops) / 1e6,
-            "flops_str": str(flops_str),
-        })
-
-        print("\n" + "=" * 72)
-        print("[Efficiency] LRU + AvePooling+MLP downstream complexity (THOP)")
-        print(f"[Efficiency] Input shape : (1, {seq_len}, {input_dim})")
-        print(f"[Efficiency] Parameters  : {params_str} ({float(params)/1e6:.6f} M)")
-        print(f"[Efficiency] FLOPs       : {flops_str} ({float(flops)/1e6:.6f} M)")
-        print("[Efficiency] FLOPs convention: FLOPs = 2 x MACs")
-        print("=" * 72 + "\n")
-
-    except Exception as exc:
-        result["error"] = repr(exc)
-        print(f"[Efficiency][WARN] THOP profiling failed: {repr(exc)}")
-
-    finally:
-        try:
-            prof_model.cpu()
-        except Exception:
-            pass
-
-        del dummy_input, dummy_mask, prof_model
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return result
-
-
-# ============================================================
-# Stage4 Lightning model
-# ============================================================
-
-class WhisperLRUDownstreamClassifier(pl.LightningModule):
-    def __init__(self):
-        super().__init__()
-
-        self.maxstep = TRAINING_STEP
-        self.batch_size = BATCH_SIZE
-        self.num_workers = NUM_WORKERS
-
-        # ----------------------------------------------------
-        # Train / validation: fixed 80/20
-        # ----------------------------------------------------
-        train_base = PretrainEmoDataset(
-            DATADIR,
-            LABELPATH,
-            split="Train",
-        )
-
-        n_total = len(train_base)
-        if n_total < 2:
-            raise ValueError(f"[Stage4] Train split too small: N={n_total}")
-
-        n_train = int(round(n_total * VALID_SPLIT))
-        n_train = min(max(1, n_train), n_total - 1)
-        n_val = n_total - n_train
-
-        generator = torch.Generator().manual_seed(SEED)
-        self.traindata, self.valdata = random_split(
-            train_base,
-            [n_train, n_val],
-            generator=generator,
-        )
-
-        self._train_collate_fn = train_base.pad30s_collate
-        self._val_collate_fn = train_base.pad30s_collate
-
-        print("[Stage4] Split strategy = random Train split 80/20.")
-        print(f"[Stage4] Train={n_train}, Val={n_val}, seed={SEED}")
-
-        # Test uses exactly the same label-index mapping as Train.
-        self.testdata = PretrainEmoDataset(
-            DATADIR,
-            LABELPATH,
-            split="Test",
-            labeldict=train_base.labeldict,
-            emoset=train_base.emoset,
-        )
-        self.num_classes = train_base.nemos
-
-        # ----------------------------------------------------
-        # Class weights: actual 80% optimization subset
-        # ----------------------------------------------------
-        class_counts = [0] * self.num_classes
-        for subset_index in self.traindata.indices:
-            label_index = train_base.hard_label_at_index(subset_index)
-            class_counts[label_index] += 1
-
-        class_count_dict = dict(zip(train_base.emoset, class_counts))
-        print(f"[Stage4] Train subset class counts: {class_count_dict}")
-
-        count_tensor = torch.tensor(
-            [max(1, count) for count in class_counts],
-            dtype=torch.float,
-        )
-        weights = count_tensor.sum() / count_tensor
-        weights = weights / weights.sum()
-
-        print(f"[Stage4] Class weights: {weights}")
-        self.register_buffer("class_weights", weights)
-
-        try:
-            self.criterion = nn.CrossEntropyLoss(
-                weight=self.class_weights,
-                label_smoothing=LABEL_SMOOTHING,
-            )
-        except TypeError:
-            self.criterion = nn.CrossEntropyLoss(
-                weight=self.class_weights
-            )
-
-        # ----------------------------------------------------
-        # Stage3-adapted Whisper + final LRU downstream
-        # ----------------------------------------------------
-        self.whisper = WhisperLayer11Wrapper(STAGE3_CKPT_PATH)
-        d_model = int(self.whisper.hidden_size)
-
-        self.lru = LRUStack(
-            d_model=d_model,
-            n_layers=LRU_LAYERS,
-            d_state=LRU_D_STATE,
-            dropout=LRU_DROPOUT,
-        )
-        self.utt_pool = MaskedMeanPool()
-        self.utt_head = MLPHead(
-            in_dim=d_model,
-            hidden_dim=MLP_HIDDEN_DIM,
-            num_classes=self.num_classes,
-            dropout=MLP_DROPOUT,
-        )
-
-        self.val_step_outputs = []
-        self.test_step_outputs = []
-
-        # Efficiency state.
-        self.efficiency_train_steps = 0
-        self.efficiency_gpu_mem_mb = []
-        self.efficiency_train_start_time = None
-        self.efficiency_total_time = 0.0
-
-        print(f"[Stage4] Encoder token length T_enc={T_ENC}")
 
     # --------------------------------------------------------
-    # Forward
+    # Collate
     # --------------------------------------------------------
 
-    def forward(
-        self,
-        wav_batch: torch.Tensor,
-        valid_len_samples: torch.Tensor,
-    ):
-        reps, valid_mask = self.whisper.encode_layer11(
-            wav_batch,
-            valid_len_samples,
+    def _collate(self, batch):
+        wavs, wav_lens, labels, names = zip(*batch)
+
+        # Audio -> exactly 30 s
+        wav_30_list = []
+        for wav, wav_len in zip(wavs, wav_lens):
+            wav_np = wav.detach().cpu().numpy().astype(np.float32)
+            wav_30s, _ = zero_pad_or_center_crop_to_30s(
+                wav_np,
+                int(wav_len),
+            )
+            wav_30_list.append(torch.from_numpy(wav_30s))
+
+        wav_batch = torch.stack(wav_30_list, dim=0).float()
+
+        # Pseudo labels + valid mask
+        batch_size = len(labels)
+        label_batch = torch.full(
+            (batch_size, len(KS), T_ENC),
+            fill_value=IGNORE_INDEX,
+            dtype=torch.long,
+        )
+        valid_mask = torch.zeros(
+            (batch_size, T_ENC),
+            dtype=torch.bool,
         )
 
-        reps = reps.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
+        for i, label in enumerate(labels):
+            if label.dim() != 2:
+                raise RuntimeError(
+                    f"[Stage3] label dim={label.dim()}, expected=2"
+                )
+            if label.size(0) != len(KS):
+                raise RuntimeError(
+                    f"[Stage3] label heads={label.size(0)}, expected={len(KS)}"
+                )
 
-        seq = self.lru(reps)
-        utt_repr = self.utt_pool(seq, valid_mask)
-        utt_logits = self.utt_head(utt_repr)
+            label_length = int(label.shape[1])
+            copy_length = min(label_length, T_ENC)
+            label_batch[i, :, :copy_length] = label[:, :copy_length]
 
-        return utt_logits
+            # 三个 head 在该位置都不是 -100 时，才视为有效 token。
+            valid_mask[i, :copy_length] = (
+                label_batch[i, :, :copy_length] != IGNORE_INDEX
+            ).all(dim=0)
+
+        return wav_batch, label_batch, valid_mask, list(names)
 
     # --------------------------------------------------------
     # DataLoaders
     # --------------------------------------------------------
 
     def train_dataloader(self):
-        return data.DataLoader(
-            self.traindata,
+        return DataLoader(
+            self.train_data,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=True,
             drop_last=True,
-            collate_fn=self._train_collate_fn,
-            pin_memory=torch.cuda.is_available(),
+            collate_fn=self._collate,
+            pin_memory=True,
             persistent_workers=(self.num_workers > 0),
         )
 
     def val_dataloader(self):
-        return data.DataLoader(
-            self.valdata,
+        return DataLoader(
+            self.val_data,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=False,
             drop_last=False,
-            collate_fn=self._val_collate_fn,
-            pin_memory=torch.cuda.is_available(),
-            persistent_workers=(self.num_workers > 0),
-        )
-
-    def test_dataloader(self):
-        return data.DataLoader(
-            self.testdata,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
-            drop_last=False,
-            collate_fn=self.testdata.pad30s_collate,
-            pin_memory=torch.cuda.is_available(),
+            collate_fn=self._collate,
+            pin_memory=True,
             persistent_workers=(self.num_workers > 0),
         )
 
     # --------------------------------------------------------
-    # Optimizer / scheduler
+    # Optimizer + scheduler
     # --------------------------------------------------------
 
     def configure_optimizers(self):
-        encoder_params = list(self.whisper.trainable_params())
-        downstream_params = (
-            list(self.lru.parameters())
-            + list(self.utt_pool.parameters())
-            + list(self.utt_head.parameters())
-        )
+        encoder_params = [
+            p for p in self.whisper.parameters()
+            if p.requires_grad
+        ]
 
         optimizer = optim.AdamW(
             [
                 {"params": encoder_params, "lr": LR_ENC},
-                {"params": downstream_params, "lr": LR_HEAD},
+                {"params": [self.mask_token], "lr": LR_ENC},
+                {"params": self.heads.parameters(), "lr": LR_HEAD},
             ],
             weight_decay=WEIGHT_DECAY,
         )
 
-        num_warmup = int(WARMUP_RATIO * self.maxstep)
-        num_flat = int(FLAT_RATIO * self.maxstep)
+        num_training_steps = self.maxstep
+        num_warmup_steps = int(WARMUP_RATIO * num_training_steps)
+        num_flat_steps = int(FLAT_RATIO * num_training_steps)
 
         def lambda_lr(step: int):
-            if step < num_warmup:
-                return float(step) / float(max(1, num_warmup))
+            if step < num_warmup_steps:
+                return float(step) / float(max(1, num_warmup_steps))
 
-            if step < num_warmup + num_flat:
+            if step < num_warmup_steps + num_flat_steps:
                 return 1.0
 
             return max(
                 0.0,
-                float(self.maxstep - step)
-                / float(max(1, self.maxstep - (num_warmup + num_flat))),
+                float(num_training_steps - step)
+                / float(
+                    max(
+                        1,
+                        num_training_steps
+                        - (num_warmup_steps + num_flat_steps),
+                    )
+                ),
             )
 
         scheduler = {
@@ -1130,433 +759,182 @@ class WhisperLRUDownstreamClassifier(pl.LightningModule):
             ),
             "interval": "step",
         }
+
         return [optimizer], [scheduler]
 
     # --------------------------------------------------------
-    # Efficiency hooks
+    # Masked cluster prediction loss
     # --------------------------------------------------------
 
-    def on_train_start(self):
-        self.efficiency_train_steps = 0
-        self.efficiency_gpu_mem_mb = []
-        self.efficiency_train_start_time = time.time()
-        self.efficiency_total_time = 0.0
+    def _compute_loss(self, reps, mask_tok, label_batch, valid_mask):
+        """只在 masked & valid token 上计算三头 weighted CE。"""
+        batch_size, token_length, dim = reps.shape
+        reps_flat = reps.reshape(batch_size * token_length, dim)
 
-    def on_train_end(self):
-        if self.efficiency_train_start_time is not None:
-            self.efficiency_total_time = float(
-                time.time() - self.efficiency_train_start_time
+        use_flat = (mask_tok & valid_mask).reshape(
+            batch_size * token_length
+        )
+
+        if use_flat.sum() == 0:
+            return reps_flat.sum() * 0.0
+
+        masked_reps = reps_flat[use_flat]
+        total_loss = 0.0
+
+        for head_idx, head in enumerate(self.heads):
+            labels_flat = label_batch[:, head_idx, :].reshape(
+                batch_size * token_length
             )
+            masked_labels = labels_flat[use_flat]
+            logits = head(masked_reps)
+            loss_i = self.criterion(logits, masked_labels)
+            total_loss = total_loss + self.head_weights[head_idx] * loss_i
+
+        return total_loss
 
     # --------------------------------------------------------
-    # Train / validation / test
+    # Train / validation
     # --------------------------------------------------------
 
     def training_step(self, batch, batch_idx):
-        self.efficiency_train_steps += 1
+        wav_batch, label_batch, valid_mask, _names = batch
+        wav_batch = wav_batch.to(self.device)
+        label_batch = label_batch.to(self.device)
+        valid_mask = valid_mask.to(self.device)
 
-        wav_batch, labels, valid_len = batch
-        wav_batch = wav_batch.to(self.device).float()
-        labels = labels.to(self.device).long()
-        valid_len = valid_len.to(self.device).long()
+        mask_tok = make_time_mask_tok_valid(valid_mask)
 
-        utt_logits = self(
+        # AMP 由 Lightning Trainer(precision="16-mixed") 统一管理。
+        reps = self.encode_with_hidden_mask(
             wav_batch,
-            valid_len,
+            mask_tok,
+            valid_mask,
+        )
+        loss = self._compute_loss(
+            reps,
+            mask_tok,
+            label_batch,
+            valid_mask,
         )
 
-        loss = self.criterion(utt_logits, labels)
-
-        prediction = torch.argmax(utt_logits, dim=-1)
-        acc_utt = (prediction == labels).float().mean()
-
-        self.log_dict(
-            {
-                "loss": loss,
-                "loss_utt": loss,
-                "acc_utt": acc_utt,
-            },
-            batch_size=labels.size(0),
+        self.log(
+            "train_loss",
+            loss,
             on_step=True,
             on_epoch=True,
             prog_bar=True,
-            logger=True,
         )
         return loss
 
     def validation_step(self, batch, batch_idx):
-        wav_batch, labels, valid_len = batch
-        wav_batch = wav_batch.to(self.device).float()
-        labels = labels.to(self.device).long()
-        valid_len = valid_len.to(self.device).long()
+        wav_batch, label_batch, valid_mask, _names = batch
+        wav_batch = wav_batch.to(self.device)
+        label_batch = label_batch.to(self.device)
+        valid_mask = valid_mask.to(self.device)
 
-        utt_logits = self(
+        mask_tok = make_time_mask_tok_valid(valid_mask)
+        reps = self.encode_with_hidden_mask(
             wav_batch,
-            valid_len,
+            mask_tok,
+            valid_mask,
+        )
+        loss = self._compute_loss(
+            reps,
+            mask_tok,
+            label_batch,
+            valid_mask,
         )
 
-        loss = self.criterion(utt_logits, labels)
-
-        prediction = torch.argmax(utt_logits, dim=-1)
-
         self.log(
-            "valid_loss",
+            "val_loss",
             loss,
-            batch_size=labels.size(0),
             on_step=False,
             on_epoch=True,
             prog_bar=True,
-            logger=True,
         )
-        self.val_step_outputs.append({
-            "pred": prediction.detach().cpu(),
-            "target": labels.detach().cpu(),
-        })
         return loss
-
-    def test_step(self, batch, batch_idx):
-        wav_batch, labels, valid_len = batch
-        wav_batch = wav_batch.to(self.device).float()
-        labels = labels.to(self.device).long()
-        valid_len = valid_len.to(self.device).long()
-
-        utt_logits = self(
-            wav_batch,
-            valid_len,
-        )
-
-        loss = self.criterion(utt_logits, labels)
-
-        prediction = torch.argmax(utt_logits, dim=-1)
-
-        self.log("test_loss", loss, batch_size=labels.size(0), on_epoch=True, logger=True)
-
-        self.test_step_outputs.append({
-            "pred": prediction.detach().cpu(),
-            "target": labels.detach().cpu(),
-        })
-        return loss
-
-    def on_validation_epoch_end(self):
-        if len(self.val_step_outputs) == 0:
-            return
-
-        predictions = torch.cat(
-            [x["pred"] for x in self.val_step_outputs],
-            dim=0,
-        ).to(self.device)
-        targets = torch.cat(
-            [x["target"] for x in self.val_step_outputs],
-            dim=0,
-        ).to(self.device)
-
-        wa, ua, _ = wa_ua_from_preds(
-            predictions,
-            targets,
-            self.num_classes,
-        )
-
-        self.log(
-            "valid_WA",
-            wa,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "valid_UA",
-            ua,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-
-        if not getattr(self.trainer, "sanity_checking", False):
-            print(f"[Validation] WA = {wa.item() * 100:.2f}%, UA = {ua.item() * 100:.2f}%")
-            memory_mb = get_gpu_memory_usage_mb()
-            self.efficiency_gpu_mem_mb.append(memory_mb)
-            print(
-                f"[Efficiency] Epoch GPU memory_allocated = "
-                f"{memory_mb:.2f} MB"
-            )
-
-        self.val_step_outputs.clear()
-
-    def on_test_epoch_end(self):
-        if len(self.test_step_outputs) == 0:
-            return
-
-        predictions = torch.cat(
-            [x["pred"] for x in self.test_step_outputs],
-            dim=0,
-        ).to(self.device)
-        targets = torch.cat(
-            [x["target"] for x in self.test_step_outputs],
-            dim=0,
-        ).to(self.device)
-
-        wa, ua, _ = wa_ua_from_preds(
-            predictions,
-            targets,
-            self.num_classes,
-        )
-
-        self.log(
-            "test_WA",
-            wa,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "test_UA",
-            ua,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-
-        print(f"[Test] WA = {wa.item() * 100:.2f}%, UA = {ua.item() * 100:.2f}%")
-        self.test_step_outputs.clear()
 
 
 # ============================================================
-# Runner
+# Main
 # ============================================================
-
-def build_saving_path() -> str:
-    return os.path.join(
-        os.path.expanduser(BASE_SAVING_DIR),
-        f"sess{SESSION_ID}_layer{OUTPUT_LAYER}_lru_avepool_mlp_seed{SEED}",
-    )
-
 
 def main():
+    os.makedirs(SAVING_PATH, exist_ok=True)
+
     pl.seed_everything(SEED, workers=True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
+    precision = "16-mixed" if PRECISION == 16 else "32-true"
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
 
-    saving_path = build_saving_path()
-    os.makedirs(saving_path, exist_ok=True)
-
-    print(f"[Stage4] saving_path = {saving_path}")
-    print("[Stage4] ========================================")
-    print(f"[Stage4] Session = {SESSION_ID}")
-    print(f"[Stage4] Whisper = {WHISPER_MODEL_NAME}")
+    print("[Stage3] ========================================")
+    print(f"[Stage3] Whisper = {WHISPER_MODEL_NAME}")
+    print(f"[Stage3] Train Layers = {TRAIN_LAYER_START}-{TRAIN_LAYER_END}")
+    print(f"[Stage3] Output Layer = {OUTPUT_LAYER}")
     print(
-        f"[Stage4] Train Layers = "
-        f"{TRAIN_LAYER_START}-{TRAIN_LAYER_END}"
+        f"[Stage3] Mask injection after Layer "
+        f"{MASK_INJECT_AFTER_LAYER}"
     )
-    print(f"[Stage4] Output Layer = {OUTPUT_LAYER}")
-    print("[Stage4] Audio = <30s zero-pad, >30s center-crop")
-    print("[Stage4] Train/Val = 80/20")
-    print("[Stage4] Downstream = LRU -> AvePooling -> MLP")
-    print("[Stage4] Loss = utterance-level cross entropy only")
+    print(f"[Stage3] Mask prob = {MASK_PROB}")
     print(
-        f"[Stage4] LRU = {LRU_LAYERS} layers, "
-        f"d_state={LRU_D_STATE}"
+        f"[Stage3] Random mask span = "
+        f"{MASK_SPAN_MIN}–{MASK_SPAN_MAX} tokens"
     )
+    print(f"[Stage3] K = {KS}")
     print(
-        f"[Stage4] MLP = {MLP_HIDDEN_DIM} hidden units, "
-        f"dropout={MLP_DROPOUT}"
+        f"[Stage3] Train/Val = {VALID_SPLIT:.1f}/"
+        f"{1.0 - VALID_SPLIT:.1f}"
     )
-    print("[Stage4] ========================================")
-
-    model = WhisperLRUDownstreamClassifier()
-
-    # Parameters/FLOPs are measured before Lightning takes device ownership.
-    complexity_stats = get_model_metrics(
-        model,
-        seq_len=T_ENC,
-        input_dim=model.whisper.hidden_size,
-    )
+    print("[Stage3] Audio = <30s zero-pad, >30s center-crop")
+    print("[Stage3] ========================================")
 
     checkpoint_callback = ModelCheckpoint(
-        dirpath=saving_path,
+        dirpath=SAVING_PATH,
         filename=(
-            f"whisper-s4-layer{OUTPUT_LAYER}-lru-avemlp-sess{SESSION_ID}-"
-            "{epoch:02d}-valid_loss={valid_loss:.4f}-"
-            "valid_UA={valid_UA:.4f}-valid_WA={valid_WA:.4f}"
+            "whisper-s3-layer11-"
+            "{epoch:02d}-{val_loss:.4f}"
         ),
-        save_top_k=SAVE_TOP_K,
-        monitor="valid_loss",
+        monitor="val_loss",
         mode="min",
-        verbose=True,
+        save_top_k=1,
         save_last=True,
+        verbose=True,
     )
 
     early_stop_callback = EarlyStopping(
-        monitor="valid_loss",
+        monitor="val_loss",
         mode="min",
-        patience=EARLY_STOP_PATIENCE,
+        patience=EARLY_PATIENCE,
+        min_delta=EARLY_MIN_DELTA,
         verbose=True,
     )
 
-    logger = False
-    enable_progress_bar = True
-
-    if ENABLE_CSV_LOGGER:
-        logger = CSVLogger(
-            save_dir=saving_path,
-            name="csv_logs",
-        )
-        enable_progress_bar = False
-
-    pl_precision = "16-mixed" if PRECISION == 16 else "32-true"
-    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    model = WhisperPTAPTModule()
 
     trainer = Trainer(
-        precision=pl_precision,
+        precision=precision,
         callbacks=[
             checkpoint_callback,
             early_stop_callback,
         ],
-        check_val_every_n_epoch=CHECK_VAL_EVERY_N_EPOCH,
         max_steps=TRAINING_STEP,
         accelerator=accelerator,
         devices=1,
-        logger=logger,
-        enable_progress_bar=enable_progress_bar,
-        log_every_n_steps=10,
-        accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
+        logger=False,
+        num_sanity_val_steps=0,
+        check_val_every_n_epoch=1,
         gradient_clip_val=GRAD_CLIP,
         gradient_clip_algorithm="norm",
         deterministic=True,
     )
 
-    ckpt_path = (
-        None
-        if RESUME_CHECKPOINT in [None, "", "None", "none"]
-        else RESUME_CHECKPOINT
-    )
-    trainer.fit(model, ckpt_path=ckpt_path)
+    trainer.fit(model)
 
-    # --------------------------------------------------------
-    # Efficiency summary
-    # --------------------------------------------------------
-    total_time = float(model.efficiency_total_time)
-    total_steps = int(model.efficiency_train_steps)
-
-    avg_memory = (
-        float(np.mean(model.efficiency_gpu_mem_mb))
-        if len(model.efficiency_gpu_mem_mb) > 0
-        else 0.0
-    )
-    time_per_1000_steps = (
-        float(total_time / total_steps * 1000.0)
-        if total_steps > 0
-        else 0.0
-    )
-
-    efficiency_summary = {
-        "model": "LRU_avepool_mlp",
-        "session_id": SESSION_ID,
-        "seed": SEED,
-        "output_layer": OUTPUT_LAYER,
-        "measurement_scope": {
-            "time_and_gpu_memory": (
-                "full Stage4 training process (Whisper + LRU downstream)"
-            ),
-            "parameters_and_flops": (
-                "LRU + masked temporal average pooling + MLP classifier"
-            ),
-        },
-        "time_method": (
-            "wall-clock time from Lightning on_train_start to on_train_end; "
-            "one training batch = one measured step"
-        ),
-        "gpu_memory_method": (
-            "mean of torch.cuda.memory_allocated() sampled "
-            "after each validation epoch"
-        ),
-        "parameter_flops_method": (
-            "THOP profile with batch_size=1; FLOPs = MACs * 2.0"
-        ),
-        "total_time_s": total_time,
-        "total_steps": total_steps,
-        "time_per_1000_steps_s": time_per_1000_steps,
-        "avg_gpu_memory_mb": avg_memory,
-        "gpu_memory_samples_mb": [
-            float(x) for x in model.efficiency_gpu_mem_mb
-        ],
-        "parameters": complexity_stats,
-    }
-
-    summary_path = os.path.join(
-        saving_path,
-        "efficiency_metrics.json",
-    )
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(
-            efficiency_summary,
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    params_m = complexity_stats.get("params_m")
-    flops_m = complexity_stats.get("flops_m")
-
-    print("\n" + "=" * 78)
-    print("[Efficiency] FINAL TRAINING EFFICIENCY / MODEL COMPLEXITY")
-    print(f"[Efficiency] Time per 1000 Steps (s) : {time_per_1000_steps:.2f}")
-    print(f"[Efficiency] Avg. GPU Memory (MB)    : {avg_memory:.2f}")
     print(
-        "[Efficiency] Parameters (M)          : "
-        + (f"{float(params_m):.6f}" if params_m is not None else "N/A")
+        f"[Stage3] 训练完成，best/last checkpoint 保存在：{SAVING_PATH}"
     )
-    print(
-        "[Efficiency] FLOPs (M)               : "
-        + (f"{float(flops_m):.6f}" if flops_m is not None else "N/A")
-    )
-    print(f"[Efficiency] Saved JSON              : {summary_path}")
-
-    if params_m is not None and flops_m is not None:
-        print(
-            "[Efficiency][TABLE_ROW] "
-            f"LRU+AvePooling+MLP | {time_per_1000_steps:.2f} | {avg_memory:.2f} | "
-            f"{float(params_m):.2f} | {float(flops_m):.2f}"
-        )
-
-    print("=" * 78 + "\n")
-
-    # Test the checkpoint selected by minimum validation loss.
-    # Lightning returns metrics as ratios (0 to 1); export percent values too.
-    try:
-        test_results = trainer.test(model, ckpt_path="best")
-        if test_results:
-            metrics = test_results[0]
-            if "test_UA" in metrics and "test_WA" in metrics:
-                report = {
-                    "session_id": SESSION_ID,
-                    "seed": SEED,
-                    "num_classes": model.num_classes,
-                    "UA_percent": 100.0 * float(metrics["test_UA"]),
-                    "WA_percent": 100.0 * float(metrics["test_WA"]),
-                    "test_loss": float(metrics["test_loss"]) if "test_loss" in metrics else None,
-                    "note": "Single held-out fold; not cross-validation mean",
-                }
-                result_path = os.path.join(saving_path, "test_metrics.json")
-                with open(result_path, "w", encoding="utf-8") as f:
-                    json.dump(report, f, indent=2, ensure_ascii=False)
-                print(
-                    f"[Stage4] Test UA = {report['UA_percent']:.2f}%, "
-                    f"WA = {report['WA_percent']:.2f}%"
-                )
-                print(f"[Stage4] Saved test metrics: {result_path}")
-            else:
-                print("[Stage4][WARN] No test_UA/test_WA in returned metrics.")
-    except Exception as exc:
-        print(
-            f"[Stage4][WARN] trainer.test failed/skipped: {repr(exc)}"
-        )
-
-    print(f"[Stage4] DONE. ckpts/logs under: {saving_path}")
 
 
 if __name__ == "__main__":

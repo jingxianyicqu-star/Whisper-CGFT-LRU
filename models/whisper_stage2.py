@@ -36,9 +36,6 @@ LABELPATH = str(
 )
 OUTPUTDIR = str(PROJECT_ROOT / "outputs" / f"stage2_sess{SESSION_ID}")
 
-# Optional explicit checkpoint selection, for example:
-#     STAGE1_CKPT=/path/to/your/stage1-best.ckpt python models/whisper_stage2.py
-# If unset, exactly one .ckpt must exist in outputs/stage1_sess{SESSION_ID}/.
 INIT_CKPT = os.environ.get("STAGE1_CKPT", "").strip()
 
 
@@ -106,13 +103,7 @@ IGNORE_INDEX = -100
 # ============================================================
 
 def compute_valid_token_length(wav_len_samples: int) -> int:
-    """
-    将有效 waveform 长度映射到 Whisper encoder 的有效 token 长度。
-
-    Whisper:
-        mel frames    ~= ceil(samples / hop_length)
-        encoder token ~= ceil(mel_frames / 2)
-    """
+   
     if wav_len_samples <= 0:
         return 1
 

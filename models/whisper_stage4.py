@@ -3,11 +3,10 @@ import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import math
 import json
-import time
 import inspect
 from collections import Counter
 from contextlib import nullcontext
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import soundfile as sf
@@ -26,20 +25,6 @@ from pytorch_lightning.loggers import CSVLogger
 
 from transformers import WhisperModel, WhisperFeatureExtractor
 
-
-# ============================================================
-# Optional THOP profiler
-# ============================================================
-
-try:
-    from thop import profile, clever_format
-    THOP_AVAILABLE = True
-    THOP_IMPORT_ERROR = None
-except Exception as exc:
-    profile = None
-    clever_format = None
-    THOP_AVAILABLE = False
-    THOP_IMPORT_ERROR = exc
 
 os.environ.pop("PL_TRAINER_AMP_BACKEND", None)
 
@@ -203,16 +188,6 @@ def wa_ua_from_preds(
     ua = recall[present].mean() if present.any() else torch.tensor(0.0)
 
     return wa.to(device), ua.to(device), confusion.to(device)
-
-
-def get_gpu_memory_usage_mb() -> float:
-    """Same efficiency definition as the original code."""
-    if not torch.cuda.is_available():
-        return 0.0
-    try:
-        return float(torch.cuda.memory_allocated() / (1024 * 1024))
-    except Exception:
-        return 0.0
 
 
 # ============================================================
@@ -789,129 +764,6 @@ class WhisperLayer11Wrapper(nn.Module):
 
 
 # ============================================================
-# Downstream complexity profiling
-# ============================================================
-
-class DownstreamProfileWrapper(nn.Module):
-    """
-    Profile the simplified downstream only:
-      LRU + masked temporal average pooling + MLP classifier.
-    """
-
-    def __init__(self, stage4_model):
-        super().__init__()
-        self.lru = stage4_model.lru
-        self.utt_pool = stage4_model.utt_pool
-        self.utt_head = stage4_model.utt_head
-
-    def forward(
-        self,
-        reps: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ):
-        valid_mask = valid_mask.bool()
-        reps = reps.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
-
-        seq = self.lru(reps)
-        utt_repr = self.utt_pool(seq, valid_mask)
-        utt_logits = self.utt_head(utt_repr)
-
-        return utt_logits
-
-
-@torch.no_grad()
-def get_model_metrics(
-    stage4_model,
-    seq_len: int,
-    input_dim: int,
-) -> Dict[str, Any]:
-    """
-    THOP convention:
-        macs, params = profile(...)
-        FLOPs = 2 * MACs
-    """
-    result = {
-        "available": False,
-        "params": None,
-        "params_m": None,
-        "params_str": None,
-        "macs": None,
-        "flops": None,
-        "flops_m": None,
-        "flops_str": None,
-        "seq_len": int(seq_len),
-        "input_dim": int(input_dim),
-        "batch_size": 1,
-        "scope": "downstream_lru_avepool_mlp",
-        "method": "THOP profile; FLOPs = MACs * 2.0",
-    }
-
-    if not THOP_AVAILABLE:
-        print("[Efficiency][WARN] THOP unavailable; skip Parameters/FLOPs.")
-        print(f"[Efficiency][WARN] {repr(THOP_IMPORT_ERROR)}")
-        return result
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prof_model = DownstreamProfileWrapper(stage4_model).to(device).eval()
-
-    dummy_input = torch.randn(
-        1, int(seq_len), int(input_dim),
-        dtype=torch.float32,
-        device=device,
-    )
-    dummy_mask = torch.ones(
-        1, int(seq_len),
-        dtype=torch.bool,
-        device=device,
-    )
-
-    try:
-        macs, params = profile(
-            prof_model,
-            inputs=(dummy_input, dummy_mask),
-            verbose=False,
-        )
-        flops = macs * 2.0
-        flops_str, params_str = clever_format([flops, params], "%.3f")
-
-        result.update({
-            "available": True,
-            "params": float(params),
-            "params_m": float(params) / 1e6,
-            "params_str": str(params_str),
-            "macs": float(macs),
-            "flops": float(flops),
-            "flops_m": float(flops) / 1e6,
-            "flops_str": str(flops_str),
-        })
-
-        print("\n" + "=" * 72)
-        print("[Efficiency] LRU + AvePooling+MLP downstream complexity (THOP)")
-        print(f"[Efficiency] Input shape : (1, {seq_len}, {input_dim})")
-        print(f"[Efficiency] Parameters  : {params_str} ({float(params)/1e6:.6f} M)")
-        print(f"[Efficiency] FLOPs       : {flops_str} ({float(flops)/1e6:.6f} M)")
-        print("[Efficiency] FLOPs convention: FLOPs = 2 x MACs")
-        print("=" * 72 + "\n")
-
-    except Exception as exc:
-        result["error"] = repr(exc)
-        print(f"[Efficiency][WARN] THOP profiling failed: {repr(exc)}")
-
-    finally:
-        try:
-            prof_model.cpu()
-        except Exception:
-            pass
-
-        del dummy_input, dummy_mask, prof_model
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return result
-
-
-# ============================================================
 # Stage4 Lightning model
 # ============================================================
 
@@ -1016,12 +868,6 @@ class WhisperLRUDownstreamClassifier(pl.LightningModule):
 
         self.val_step_outputs = []
         self.test_step_outputs = []
-
-        # Efficiency state.
-        self.efficiency_train_steps = 0
-        self.efficiency_gpu_mem_mb = []
-        self.efficiency_train_start_time = None
-        self.efficiency_total_time = 0.0
 
         print(f"[Stage4] Encoder token length T_enc={T_ENC}")
 
@@ -1133,28 +979,10 @@ class WhisperLRUDownstreamClassifier(pl.LightningModule):
         return [optimizer], [scheduler]
 
     # --------------------------------------------------------
-    # Efficiency hooks
-    # --------------------------------------------------------
-
-    def on_train_start(self):
-        self.efficiency_train_steps = 0
-        self.efficiency_gpu_mem_mb = []
-        self.efficiency_train_start_time = time.time()
-        self.efficiency_total_time = 0.0
-
-    def on_train_end(self):
-        if self.efficiency_train_start_time is not None:
-            self.efficiency_total_time = float(
-                time.time() - self.efficiency_train_start_time
-            )
-
-    # --------------------------------------------------------
     # Train / validation / test
     # --------------------------------------------------------
 
     def training_step(self, batch, batch_idx):
-        self.efficiency_train_steps += 1
-
         wav_batch, labels, valid_len = batch
         wav_batch = wav_batch.to(self.device).float()
         labels = labels.to(self.device).long()
@@ -1273,12 +1101,6 @@ class WhisperLRUDownstreamClassifier(pl.LightningModule):
 
         if not getattr(self.trainer, "sanity_checking", False):
             print(f"[Validation] WA = {wa.item() * 100:.2f}%, UA = {ua.item() * 100:.2f}%")
-            memory_mb = get_gpu_memory_usage_mb()
-            self.efficiency_gpu_mem_mb.append(memory_mb)
-            print(
-                f"[Efficiency] Epoch GPU memory_allocated = "
-                f"{memory_mb:.2f} MB"
-            )
 
         self.val_step_outputs.clear()
 
@@ -1369,13 +1191,6 @@ def main():
 
     model = WhisperLRUDownstreamClassifier()
 
-    # Parameters/FLOPs are measured before Lightning takes device ownership.
-    complexity_stats = get_model_metrics(
-        model,
-        seq_len=T_ENC,
-        input_dim=model.whisper.hidden_size,
-    )
-
     checkpoint_callback = ModelCheckpoint(
         dirpath=saving_path,
         filename=(
@@ -1435,95 +1250,6 @@ def main():
         else RESUME_CHECKPOINT
     )
     trainer.fit(model, ckpt_path=ckpt_path)
-
-    # --------------------------------------------------------
-    # Efficiency summary
-    # --------------------------------------------------------
-    total_time = float(model.efficiency_total_time)
-    total_steps = int(model.efficiency_train_steps)
-
-    avg_memory = (
-        float(np.mean(model.efficiency_gpu_mem_mb))
-        if len(model.efficiency_gpu_mem_mb) > 0
-        else 0.0
-    )
-    time_per_1000_steps = (
-        float(total_time / total_steps * 1000.0)
-        if total_steps > 0
-        else 0.0
-    )
-
-    efficiency_summary = {
-        "model": "LRU_avepool_mlp",
-        "session_id": SESSION_ID,
-        "seed": SEED,
-        "output_layer": OUTPUT_LAYER,
-        "measurement_scope": {
-            "time_and_gpu_memory": (
-                "full Stage4 training process (Whisper + LRU downstream)"
-            ),
-            "parameters_and_flops": (
-                "LRU + masked temporal average pooling + MLP classifier"
-            ),
-        },
-        "time_method": (
-            "wall-clock time from Lightning on_train_start to on_train_end; "
-            "one training batch = one measured step"
-        ),
-        "gpu_memory_method": (
-            "mean of torch.cuda.memory_allocated() sampled "
-            "after each validation epoch"
-        ),
-        "parameter_flops_method": (
-            "THOP profile with batch_size=1; FLOPs = MACs * 2.0"
-        ),
-        "total_time_s": total_time,
-        "total_steps": total_steps,
-        "time_per_1000_steps_s": time_per_1000_steps,
-        "avg_gpu_memory_mb": avg_memory,
-        "gpu_memory_samples_mb": [
-            float(x) for x in model.efficiency_gpu_mem_mb
-        ],
-        "parameters": complexity_stats,
-    }
-
-    summary_path = os.path.join(
-        saving_path,
-        "efficiency_metrics.json",
-    )
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(
-            efficiency_summary,
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    params_m = complexity_stats.get("params_m")
-    flops_m = complexity_stats.get("flops_m")
-
-    print("\n" + "=" * 78)
-    print("[Efficiency] FINAL TRAINING EFFICIENCY / MODEL COMPLEXITY")
-    print(f"[Efficiency] Time per 1000 Steps (s) : {time_per_1000_steps:.2f}")
-    print(f"[Efficiency] Avg. GPU Memory (MB)    : {avg_memory:.2f}")
-    print(
-        "[Efficiency] Parameters (M)          : "
-        + (f"{float(params_m):.6f}" if params_m is not None else "N/A")
-    )
-    print(
-        "[Efficiency] FLOPs (M)               : "
-        + (f"{float(flops_m):.6f}" if flops_m is not None else "N/A")
-    )
-    print(f"[Efficiency] Saved JSON              : {summary_path}")
-
-    if params_m is not None and flops_m is not None:
-        print(
-            "[Efficiency][TABLE_ROW] "
-            f"LRU+AvePooling+MLP | {time_per_1000_steps:.2f} | {avg_memory:.2f} | "
-            f"{float(params_m):.2f} | {float(flops_m):.2f}"
-        )
-
-    print("=" * 78 + "\n")
 
     # Test the checkpoint selected by minimum validation loss.
     # Lightning returns metrics as ratios (0 to 1); export percent values too.
