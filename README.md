@@ -15,7 +15,7 @@ For **IEMOCAP**, the four classes are **angry, happy, sad, and neutral**, with *
 
 For **SAVEE**, all seven original emotion classes are used: **anger, disgust, fear, happiness, neutral, sadness, and surprise**. The reported evaluation uses **ten-fold cross-validation**. 
 
-Audio recordings must be **prepared at 16 kHz before running the scripts**. Each stage then normalizes the waveform length to **30 seconds**: shorter utterances are zero-padded at the end, and utterances longer than 30 seconds are center-cropped. A validity mask is used to distinguish speech tokens from padding where applicable. The supplied scripts do **not** include a complete audio resampling or dataset-splitting utility.
+Audio recordings must be **prepared at 16 kHz before running the scripts**. Each stage then normalizes the waveform length to **30 seconds**: shorter utterances are zero-padded at the end, and utterances longer than 30 seconds are center-cropped. A validity mask is used to distinguish speech tokens from padding where applicable. 
 
 The supervised stages use a `Train` split supplied by an external label JSON file, and subdivide that split approximately **80%/20%** into optimization and validation subsets. The final supervised stage also reads an external `Test` split. The outer folds (IEMOCAP sessions or SAVEE ten-fold partitions) must be constructed separately, with no overlap between the `Train` and `Test` partitions for a given fold.
 
