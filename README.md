@@ -166,11 +166,6 @@ The previously recorded experimental environment is summarized below. Exact depe
 | torchaudio | 2.0.2 |
 | CUDA | 11.8 |
 | PyTorch Lightning | 2.0.2 |
-| transformers | Required; verify installed version |
-| faiss-cpu | Required for Stage 2; verify installed version |
-| numpy | Required; verify installed version |
-| soundfile | Required; verify installed version |
-| tqdm | Required for Stage 2; verify installed version |
 
 The implementation uses `WhisperModel` and `WhisperFeatureExtractor` from Hugging Face Transformers. Some encoder calls include compatibility handling for different library versions, but equivalent results are not guaranteed across untested environments.
 
