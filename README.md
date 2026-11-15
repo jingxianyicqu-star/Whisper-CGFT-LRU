@@ -44,7 +44,7 @@ The upstream model is **`openai/whisper-small`**. Speech representations are ext
 
 **Stage 4** initializes Whisper from the Stage 3 checkpoint. Its downstream classifier is:
 
-`Whisper Layer 11 -> two-layer LRU -> masked temporal average pooling -> MLP -> emotion prediction`
+`Whisper Layer 11 -> two-layer LRU -> temporal average pooling -> MLP -> emotion prediction`
 
 The two LRU blocks use a state dimension of **128**. The MLP contains LayerNorm, a hidden linear layer of dimension **128**, ReLU, dropout, and an output linear layer. Whisper and the downstream model are jointly optimized using utterance-level, class-weighted cross-entropy, with **no auxiliary frame-level loss**.
 
