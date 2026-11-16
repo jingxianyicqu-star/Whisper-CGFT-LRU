@@ -147,6 +147,8 @@ Stage 4 reports **weighted accuracy (`test_WA`)** and **unweighted accuracy (`te
 
 The provided scripts are configured primarily for **IEMOCAP Session 1**, not as separate ready-to-run IEMOCAP and SAVEE implementations. To run all folds, repeat the four stages with correctly matched data partitions, checkpoint paths and output folders. For **SAVEE seven-class ten-fold cross-validation**, prepare ten external fold label files and update each stage for each fold. If the SAVEE experiment uses a different cluster-size configuration, change `KS` consistently in **both** Stage 2 and Stage 3, and regenerate the pseudo-labels. 
 
+**Random Seeds.** We use five random seeds (42, 43, 44, 45, and 46) in our experiments. The provided scripts do not automatically iterate over these seeds. To reproduce the experiments, users need to manually change the random seed in the corresponding scripts before each run.
+
 ## **Environment Specifications**
 
 ### Hardware Configuration
