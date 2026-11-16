@@ -27,7 +27,7 @@ The framework is implemented in four sequential Python scripts:
 
 | Stage | Script | Implementation |
 | :--- | :--- | :--- |
-| Stage 1 | `whisper_stage1.py` | Supervised Whisper fine-tuning using emotion labels |
+| Stage 1 | `models/Stage1_Supervised_Whisper_Fine-Tuning.py` | Supervised Whisper fine-tuning using emotion labels |
 | Stage 2 | `whisper_stage2.py` | FAISS K-means clustering and pseudo-label generation |
 | Stage 3 | `whisper_stage3.py` | Cluster-guided Whisper fine-tuning via masked cluster prediction |
 | Stage 4 | `whisper_stage4.py` | Joint Whisper–LRU fine-tuning and emotion classification |
