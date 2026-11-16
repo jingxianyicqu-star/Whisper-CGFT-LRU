@@ -660,11 +660,7 @@ def main():
     parser.add_argument("--flat_ratio", type=float, default=0.20)
     parser.add_argument("--min_lr_ratio", type=float, default=0.05)
     parser.add_argument("--label_smoothing", type=float, default=0.10)
-
-    # Utterance-level MLP (no frame head or auxiliary frame loss).
     parser.add_argument("--head_dropout", type=float, default=0.5)
-
-    # Trainer.
     parser.add_argument("--accumulate_grad_batches", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=16)
