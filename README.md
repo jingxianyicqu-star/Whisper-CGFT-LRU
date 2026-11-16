@@ -27,16 +27,16 @@ The framework is implemented in four sequential Python scripts:
 
 | Stage | Script | Implementation |
 | :--- | :--- | :--- |
-| Stage 1 | `models/Stage1_Supervised_Whisper_Fine-Tuning.py` | Supervised Whisper fine-tuning using emotion labels |
-| Stage 2 | `whisper_stage2.py` | FAISS K-means clustering and pseudo-label generation |
-| Stage 3 | `whisper_stage3.py` | Cluster-guided Whisper fine-tuning via masked cluster prediction |
-| Stage 4 | `whisper_stage4.py` | Joint Whisper–LRU fine-tuning and emotion classification |
+| Stage 1 | `Stage1_Supervised_Whisper_Fine-Tuning.py` | Supervised Whisper fine-tuning using emotion labels |
+| Stage 2 | `Stage2_Pseudo_Label_Generation.py` | FAISS K-means clustering and pseudo-label generation |
+| Stage 3 | `Stage3_Pseudo_Label_Prediction.py` | Cluster-guided Whisper fine-tuning via masked cluster prediction |
+| Stage 4 | `Stage4_Joint_Training_with_LRU.py` | Joint Whisper–LRU fine-tuning and emotion classification |
 
 
-The upstream model is **`openai/whisper-small`**. Speech representations are extracted from **encoder Layer 11**. For the IEMOCAP experiments, **encoder Layers 8–11** are fine-tuned, while the other encoder layers remain frozen. The extracted Layer-11 representations do not pass through the encoder's final LayerNorm.
+The upstream model is **`openai/whisper-small`**. Speech representations are extracted from **encoder Layer 11**. For the IEMOCAP experiments, **encoder Layers 8–11** are fine-tuned, while the other encoder layers remain frozen. For the SAVEE experiments, **encoder Layers9–11** are fine-tuned, while the other encoder layers remain frozen. 
 
 
-**Stage 1** uses **masked temporal average pooling** and a two-layer **MLP** on top of Whisper Layer 11. It is trained with utterance-level, class-weighted cross-entropy; there is no frame-level auxiliary classification branch.
+**Stage 1** uses **temporal average pooling** and a two-layer **MLP** on top of Whisper Layer 11. It is trained with class-weighted cross-entropy.
 
 **Stage 2** loads the Whisper weights from the Stage 1 checkpoint and extracts Layer-11 representations from the designated `Train` partition. It samples **30% of valid encoder tokens per utterance** for fitting FAISS **CPU** K-means. The uploaded implementation uses three cluster sizes, **`K = [512, 1024, 2048]`**, with **200 K-means iterations**. The Stage 1 representations are computed during Stage 2; a separately saved feature file is not required.
 
@@ -145,9 +145,7 @@ Stage 4 reports **weighted accuracy (`test_WA`)** and **unweighted accuracy (`te
 
 ### **6. Dataset-specific configuration**
 
-The provided scripts are configured primarily for **IEMOCAP Session 1**, not as separate ready-to-run IEMOCAP and SAVEE implementations. To run all folds, repeat the four stages with correctly matched data partitions, checkpoint paths and output folders. For **SAVEE seven-class ten-fold cross-validation**, prepare ten external fold label files and update each stage for each fold. If the SAVEE experiment uses a different cluster-size configuration, change `KS` consistently in **both** Stage 2 and Stage 3, and regenerate the pseudo-labels. The SAVEE-specific cluster settings and split-generation code are **not established by these four uploaded scripts**.
-
-Avoid placing evaluation-test examples in the training partition or using them when fitting K-means. No raw dataset files, experiment-specific checkpoints or trained weights are supplied here.
+The provided scripts are configured primarily for **IEMOCAP Session 1**, not as separate ready-to-run IEMOCAP and SAVEE implementations. To run all folds, repeat the four stages with correctly matched data partitions, checkpoint paths and output folders. For **SAVEE seven-class ten-fold cross-validation**, prepare ten external fold label files and update each stage for each fold. If the SAVEE experiment uses a different cluster-size configuration, change `KS` consistently in **both** Stage 2 and Stage 3, and regenerate the pseudo-labels. 
 
 ## **Environment Specifications**
 
@@ -175,7 +173,7 @@ The following are the **reported experimental results**, rather than values reco
 
 | Dataset | Evaluation Protocol | UA (%) | WA (%) |
 | :--- | :--- | ---: | ---: |
-| IEMOCAP | Four-class, five-fold session-wise LOSO | **77.45** | **78.03** |
+| IEMOCAP | Four-class, five-fold cross-validation | **77.45** | **78.03** |
 | SAVEE | Seven-class, ten-fold cross-validation | **87.13** | **88.02** |
 
 These aggregate results require the corresponding fold-specific experiment outputs for independent verification. The provided Stage 4 script evaluates a configured fold and prints/logs its metrics; it does not itself produce the above cross-validation summary table. The fold-level predictions, model weights, and full dataset-preparation code are not included in the four uploaded scripts.
