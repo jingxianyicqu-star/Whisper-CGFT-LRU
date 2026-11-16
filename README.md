@@ -8,7 +8,7 @@ Experiments are reported on two benchmark SER datasets: **IEMOCAP** and **SAVEE*
 
 | Dataset | Emotion Classes | Utterances | Reported Evaluation Protocol |
 | :--- | :---: | ---: | :--- |
-| IEMOCAP | 4 | 5,531 | Five-fold leave-one-session-out (LOSO) cross-validation |
+| IEMOCAP | 4 | 5,531 | Five-fold cross-validation |
 | SAVEE | 7 | 480 | Ten-fold cross-validation |
 
 For **IEMOCAP**, the four classes are **angry, happy, sad, and neutral**, with *happy* and *excited* merged into the happy class. Under the reported LOSO protocol, each of the five recording sessions is used once as the held-out test session.
