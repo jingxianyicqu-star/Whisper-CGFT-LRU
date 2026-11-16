@@ -67,7 +67,7 @@ Place the preprocessed **16-kHz** audio files in an accessible directory and pre
 ### **2. Stage 1 — Supervised Whisper Fine-Tuning**
 
 ```bash
-python whisper_stage1.py \
+python Stage1_Supervised_Whisper_Fine-Tuning.py \
   --datadir /path/to/Audio_16k \
   --labelpath /path/to/fold_labels.json \
   --saving_path /path/to/stage1_checkpoints
@@ -77,7 +77,7 @@ Stage 1 accepts these paths as command-line arguments and trains on the label fi
 
 ### **3. Stage 2 — FAISS K-means Clustering**
 
-Before running, edit the constants near the beginning of `whisper_stage2.py`:
+Before running, edit the constants near the beginning of `Stage2_Pseudo_Label_Generation.py`:
 
 - `DATADIR`: path to 16-kHz audio files.
 - `LABELPATH`: path to the **same fold's** label JSON.
@@ -88,7 +88,7 @@ Before running, edit the constants near the beginning of `whisper_stage2.py`:
 Then run:
 
 ```bash
-python whisper_stage2.py
+python Stage2_Pseudo_Label_Generation.py
 ```
 
 The script freezes the Stage 1-initialized Whisper model, fits CPU FAISS K-means using the valid-token samples from the **external `Train` partition only**, and assigns cluster IDs to all valid tokens in that partition. Padded positions are assigned the ignore index **`-100`**. It writes:
@@ -104,7 +104,7 @@ Each entry in `all-clus.json` contains the three per-token cluster-label sequenc
 
 ### **4. Stage 3 — Cluster-Guided Fine-Tuning**
 
-Before running, edit these constants in `whisper_stage3.py`:
+Before running, edit these constants in `Stage3_Pseudo_Label_Prediction.py`:
 
 - `DATADIR`: path to the audio files.
 - `LABELPATH`: Stage 2's **`all-clus.json`** (not the emotion-label JSON).
@@ -115,7 +115,7 @@ Before running, edit these constants in `whisper_stage3.py`:
 Then run:
 
 ```bash
-python whisper_stage3.py
+python Stage3_Pseudo_Label_Prediction.py
 ```
 
 Stage 3 loads Stage 2 pseudo-labels and the Stage 1 Whisper weights. It performs masked cluster prediction without directly using emotion labels. The uploaded configuration uses batch size **8**, a **6%** token masking target, trainable Whisper Layers **8–11**, and up to **20,000 training steps**. It saves a best checkpoint selected by **`val_loss`**, as well as a last checkpoint, in `SAVING_PATH`.
@@ -124,7 +124,7 @@ Stage 3 loads Stage 2 pseudo-labels and the Stage 1 Whisper weights. It performs
 
 ### **5. Stage 4 — Joint Whisper–LRU Fine-Tuning**
 
-Before running, edit these constants in `whisper_stage4.py`:
+Before running, edit these constants in `Stage4_Joint_Training_with_LRU.py`:
 
 - `DATADIR`: path to the 16-kHz audio files.
 - `LABELPATH`: fold-specific emotion-label JSON containing both `Train` and `Test`.
@@ -135,10 +135,10 @@ Before running, edit these constants in `whisper_stage4.py`:
 Then run:
 
 ```bash
-python whisper_stage4.py
+python Stage4_Joint_Training_with_LRU.py
 ```
 
-Stage 4 trains Whisper Layers 8–11 jointly with the **two-layer LRU, masked mean pooling, and MLP**. The uploaded configuration uses batch size **16**, LRU state dimension **128**, learning rates **5e-6** (encoder) and **3e-4** (downstream), gradient accumulation of **2**, and up to **10,000 training steps**. It selects the best checkpoint using **`valid_loss`** and then attempts to evaluate that checkpoint on the external `Test` split.
+Stage 4 trains Whisper Layers 8–11 on IEMOCAP or 9-11 on SAVEE jointly with the **two-layer LRU, masked average pooling, and MLP**. The uploaded configuration uses batch size **16**, LRU state dimension **128**, learning rates **5e-6** (encoder) and **3e-4** (downstream), gradient accumulation of **2**, and up to **10,000 training steps**. It selects the best checkpoint using **`valid_loss`** and then attempts to evaluate that checkpoint on the external `Test` split.
 
 Stage 4 reports **weighted accuracy (`test_WA`)** and **unweighted accuracy (`test_UA`)**. The best checkpoint is selected based on the minimum validation loss and evaluated on the held-out test set. The evaluation results are saved in `test_metrics.json`. The scripts do not provide a complete automatic cross-fold aggregation utility.
 
